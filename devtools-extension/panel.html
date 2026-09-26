@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Payload Capture</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <header class="toolbar">
+      <label class="switch" title="Pause/resume capturing without closing DevTools">
+        <input type="checkbox" id="captureEnabled" />
+        <span class="slider"></span>
+        <span class="switch-label">Capture</span>
+      </label>
+      <label class="switch" title="Send matching requests to the server immediately. Turn off to review/rename before sending.">
+        <input type="checkbox" id="autoSend" />
+        <span class="slider"></span>
+        <span class="switch-label">Auto-send</span>
+      </label>
+
+      <span class="sep"></span>
+
+      <button id="testServer" title="GET /health on the capture server">Test server</button>
+      <span id="serverStatus" class="server-status unknown">server: ?</span>
+
+      <span class="spacer"></span>
+
+      <span id="counters" class="counters"></span>
+      <button id="sendPending" title="Send every pending row">Send pending</button>
+      <button id="clearList">Clear list</button>
+    </header>
+
+    <main>
+      <table class="captures">
+        <thead>
+          <tr>
+            <th class="col-time">Time</th>
+            <th class="col-method">Method</th>
+            <th class="col-url">URL</th>
+            <th class="col-schema">Schema name</th>
+            <th class="col-status">Status</th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody id="captureRows"></tbody>
+      </table>
+      <p id="emptyHint" class="empty-hint">
+        No captured requests yet. Trigger a POST/PUT/PATCH in the inspected page.
+        Requests that don't match the method / URL filters below are ignored.
+      </p>
+    </main>
+
+    <details id="settingsSection" class="section" open>
+      <summary>Settings</summary>
+      <div class="form-grid">
+        <label for="serverUrl">Capture server URL</label>
+        <div>
+          <input type="text" id="serverUrl" placeholder="http://127.0.0.1:4545" spellcheck="false" />
+          <small>Must be 127.0.0.1 or localhost (any port) — see manifest host_permissions.</small>
+        </div>
+
+        <label>Methods</label>
+        <div id="methodFilters" class="checkbox-row"></div>
+
+        <label for="urlFilter">URL filter</label>
+        <div>
+          <input type="text" id="urlFilter" placeholder="e.g. /api/  or  re:/v\d+/(users|orders)" spellcheck="false" />
+          <small>Empty = all URLs. Plain text = substring match, <code>re:</code> prefix = regex. Case-insensitive.</small>
+          <small id="urlFilterError" class="error hidden"></small>
+        </div>
+      </div>
+    </details>
+
+    <details id="mappingsSection" class="section" open>
+      <summary>Mappings (URL pattern → schema name)</summary>
+      <p class="help">
+        Checked top to bottom against the full request URL; first match wins. Plain text = substring,
+        <code>re:</code> prefix = regex (case-insensitive). Leave method empty to match any method.
+        Unmatched requests fall back to a name derived from the URL path, e.g.
+        <code>POST /v1/users/42</code> → <code>post_v1_users_id</code>.
+      </p>
+      <table class="mappings">
+        <thead>
+          <tr>
+            <th></th>
+            <th>URL pattern</th>
+            <th>Method</th>
+            <th>Schema name</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="mappingRows"></tbody>
+      </table>
+      <div class="button-row">
+        <button id="addMapping">+ Add row</button>
+        <button id="toggleJson">Edit as JSON</button>
+        <button id="resetMappings" class="subtle">Reset to defaults</button>
+      </div>
+      <div id="jsonEditor" class="hidden">
+        <textarea id="mappingsJson" spellcheck="false" rows="12"></textarea>
+        <div class="button-row">
+          <button id="applyJson">Apply JSON</button>
+          <span id="jsonError" class="error"></span>
+        </div>
+      </div>
+    </details>
+
+    <template id="captureRowTemplate">
+      <tr class="capture-row">
+        <td class="col-time"></td>
+        <td class="col-method"></td>
+        <td class="col-url"><span class="url-text"></span></td>
+        <td class="col-schema">
+          <input type="text" class="schema-input" spellcheck="false" />
+          <span class="schema-source"></span>
+        </td>
+        <td class="col-status"><span class="status"></span><div class="status-detail"></div></td>
+        <td class="col-actions">
+          <button class="send-btn">Send</button>
+          <button class="map-btn" title="Add a mapping row for this URL + method using the current schema name">+ Map</button>
+          <button class="view-btn" title="Show payload">{ }</button>
+        </td>
+      </tr>
+    </template>
+
+    <script src="default-mappings.js"></script>
+    <script src="panel.js"></script>
+  </body>
+</html>

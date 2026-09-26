@@ -1,0 +1,4 @@
+node_modules/
+.env
+capture-server/payloads/
+payloads/
