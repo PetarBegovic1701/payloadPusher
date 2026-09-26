@@ -73,18 +73,28 @@ button.icon { padding: 0 5px; line-height: 18px; }
 
 /* Toolbar ---------------------------------------------------------------- */
 
-.toolbar {
+.sticky {
   position: sticky;
   top: 0;
   z-index: 2;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+}
+.toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 10px;
-  background: var(--bg-alt);
-  border-bottom: 1px solid var(--border);
+  padding: 5px 10px;
   flex-wrap: wrap;
 }
+.toolbar.sub { padding-top: 0; padding-bottom: 3px; }
+.toolbar.filters { border-top: 1px solid var(--border); }
+.toolbar.filters #viewSearch { width: 280px; }
+.inline { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.output-dir input { width: 320px; }
+.dir-hint { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: var(--ok); }
+.muted, .dir-hint.muted { color: var(--muted); }
+button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
 .spacer { flex: 1; }
 .sep { width: 1px; height: 18px; background: var(--border); }
 .counters { color: var(--muted); }
@@ -134,11 +144,14 @@ th { color: var(--muted); font-weight: 600; background: var(--bg); }
 
 .captures { table-layout: fixed; }
 .captures tbody tr.capture-row:hover { background: var(--row-hover); }
+.col-flag { width: 26px; text-align: center; }
+.col-code { width: 44px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.code-error { color: var(--err); }
 .col-time { width: 95px; font-family: ui-monospace, Menlo, Consolas, monospace; }
 .col-method { width: 62px; font-weight: 700; }
 .col-schema { width: 230px; }
-.col-status { width: 230px; }
-.col-actions { width: 150px; white-space: nowrap; }
+.col-status { width: 200px; }
+.col-actions { width: 170px; white-space: nowrap; }
 .col-url .url-text {
   display: block;
   overflow: hidden;
@@ -157,8 +170,16 @@ th { color: var(--muted); font-weight: 600; background: var(--bg); }
 .status { font-weight: 700; text-transform: uppercase; font-size: 11px; }
 .status-sent { color: var(--ok); }
 .status-failed { color: var(--err); }
-.status-skipped { color: var(--warn); }
-.status-pending, .status-sending { color: var(--accent); }
+.status-new { color: var(--muted); }
+.status-sending { color: var(--accent); }
+.capture-row:has(.flag:checked) { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+/* Requests without a JSON body are listed but can't be saved. */
+.capture-row.no-json { color: var(--muted); }
+.capture-row.no-json .schema-input,
+.capture-row.no-json .schema-source,
+.capture-row.no-json .send-btn,
+.capture-row.no-json .map-btn { visibility: hidden; }
 .status-detail {
   color: var(--muted);
   font-size: 11px;
@@ -183,6 +204,7 @@ th { color: var(--muted); font-weight: 600; background: var(--bg); }
 .section { border-top: 1px solid var(--border); padding: 6px 10px 10px; }
 .section summary { font-weight: 700; cursor: pointer; padding: 4px 0; }
 .help { color: var(--muted); margin: 4px 0 8px; }
+small.lead { margin-top: 4px; }
 
 .form-grid {
   display: grid;

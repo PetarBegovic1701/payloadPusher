@@ -19,10 +19,10 @@ async function startServer(opts) {
   return { outputDir, base, close: () => new Promise((r) => server.close(r)) };
 }
 
-function post(base, body, raw = false) {
+function post(base, body, raw = false, headers = {}) {
   return fetch(`${base}/capture`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
     body: raw ? body : JSON.stringify(body),
   });
 }
@@ -132,4 +132,52 @@ test('write failure returns 500 without crashing', async (t) => {
 
   const health = await fetch(`${s.base}/health`);
   assert.equal(health.status, 200);
+});
+
+test('outputDir per request: relative, absolute, home', async (t) => {
+  const s = await startServer();
+  t.after(s.close);
+
+  let res = await post(s.base, { schemaName: 'rel', payload: { a: 1 }, outputDir: 'sub/dir' });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await readJson(path.join(s.outputDir, 'sub', 'dir', 'rel.json')), { a: 1 });
+
+  const abs = await fs.mkdtemp(path.join(os.tmpdir(), 'abs-'));
+  res = await post(s.base, { schemaName: 'abs', payload: { b: 2 }, outputDir: abs });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await readJson(path.join(abs, 'abs.json')), { b: 2 });
+
+  res = await post(s.base, { schemaName: 'x', payload: {}, outputDir: 42 });
+  assert.equal(res.status, 400);
+
+  const { resolveOutputDir } = require('../src/storage');
+  assert.equal(resolveOutputDir('/base', ''), '/base');
+  assert.equal(resolveOutputDir('/base', '~/fx'), path.join(os.homedir(), 'fx'));
+});
+
+test('GET /config resolves folders', async (t) => {
+  const s = await startServer();
+  t.after(s.close);
+  const res = await fetch(`${s.base}/config?outputDir=${encodeURIComponent('nested')}`);
+  const body = await res.json();
+  assert.equal(body.defaultOutputDir, s.outputDir);
+  assert.equal(body.outputDir, path.join(s.outputDir, 'nested'));
+  assert.equal(body.exists, false);
+});
+
+test('rejects web-page origins, allows extension origins', async (t) => {
+  const s = await startServer();
+  t.after(s.close);
+
+  let res = await post(s.base, { schemaName: 'x', payload: {} }, false, { Origin: 'https://evil.example' });
+  assert.equal(res.status, 403);
+  res = await post(s.base, { schemaName: 'x', payload: {} }, false, { Origin: 'http://localhost:3000' });
+  assert.equal(res.status, 403);
+
+  res = await post(s.base, { schemaName: 'x', payload: {} }, false, { Origin: 'chrome-extension://abcdef' });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('access-control-allow-origin'), 'chrome-extension://abcdef');
+
+  const pre = await fetch(`${s.base}/capture`, { method: 'OPTIONS', headers: { Origin: 'chrome-extension://abcdef' } });
+  assert.equal(pre.status, 204);
 });

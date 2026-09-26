@@ -1,11 +1,17 @@
 // Payload Capture panel.
 //
+// Every finished request in the inspected tab is listed. Requests with a JSON
+// body can be flagged (checkbox) and saved to the capture server, either one
+// by one or with "Save flagged". Optional matching rules can pre-flag or
+// auto-save requests as they arrive.
+//
 // Sections:
 //   1. Settings & storage
 //   2. Filter + naming logic   <- the bits you'll most likely want to tweak
-//   3. Capture pipeline (ingest -> filter -> parse -> name -> send)
-//   4. Captured-requests list UI
-//   5. Settings + mappings UI
+//   3. Capture pipeline (ingest -> parse -> name -> rules -> save)
+//   4. Request list UI (view filters, flagging, saving)
+//   5. Output folder
+//   6. Settings + mappings UI
 
 /* global DEFAULT_MAPPINGS */
 
@@ -13,27 +19,46 @@
 // 1. Settings & storage
 // ---------------------------------------------------------------------------
 
-const ALL_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE', 'GET'];
-const MAX_ROWS = 500;
+const ALL_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+const MAX_ROWS = 1000;
+const MAX_RECENT_DIRS = 8;
+const MAX_RAW_BODY = 100 * 1024; // keep at most 100 KB of non-JSON bodies for viewing
 
 const DEFAULT_SETTINGS = {
   captureEnabled: true,
-  autoSend: true,
   serverUrl: 'http://127.0.0.1:4545',
-  methods: ['POST', 'PUT', 'PATCH'],
-  urlFilter: '',
+  outputDir: '', // '' = server's default (--output-dir)
+  recentOutputDirs: [],
+  // Matching rules: what to do with a JSON request that matches them.
+  ruleAction: 'flag', // 'off' | 'flag' | 'save'
+  ruleMethods: ['POST', 'PUT', 'PATCH'],
+  ruleUrlFilter: '',
+  ruleOkOnly: true, // only match requests whose response was 2xx
+  // What the list shows. Does not affect what is recorded.
+  view: { search: '', method: '', apiOnly: true, jsonOnly: false },
 };
 
 const state = {
-  settings: { ...DEFAULT_SETTINGS },
+  settings: structuredClone(DEFAULT_SETTINGS),
   mappings: [],
   entries: [], // newest first
-  ignored: 0,
 };
 
 async function loadState() {
   const stored = await chrome.storage.local.get(['settings', 'mappings']);
-  state.settings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
+  const saved = stored.settings || {};
+  // Settings from the first version used methods/urlFilter/autoSend.
+  if (saved.methods && !saved.ruleMethods) saved.ruleMethods = saved.methods;
+  if (saved.urlFilter !== undefined && saved.ruleUrlFilter === undefined) saved.ruleUrlFilter = saved.urlFilter;
+  delete saved.methods;
+  delete saved.urlFilter;
+  delete saved.autoSend;
+  state.settings = {
+    ...structuredClone(DEFAULT_SETTINGS),
+    ...saved,
+    view: { ...DEFAULT_SETTINGS.view, ...(saved.view || {}) },
+  };
+
   if (Array.isArray(stored.mappings)) {
     state.mappings = stored.mappings;
   } else {
@@ -52,7 +77,7 @@ function saveSettings() {
 }
 
 function saveMappings() {
-  reresolveUnsent();
+  reresolveUnsaved();
   return chrome.storage.local.set({ mappings: state.mappings });
 }
 
@@ -67,7 +92,7 @@ function saveMappingsSoon() {
 // ---------------------------------------------------------------------------
 
 /**
- * Compile a user pattern into a predicate over URLs.
+ * Compile a user pattern into a predicate over strings.
  *   "re:<expr>" -> case-insensitive RegExp
  *   anything else -> case-insensitive substring
  * Throws on an invalid regex so the UI can flag it.
@@ -75,25 +100,26 @@ function saveMappingsSoon() {
 function compilePattern(pattern) {
   if (pattern.startsWith('re:')) {
     const re = new RegExp(pattern.slice(3), 'i');
-    return (url) => re.test(url);
+    return (s) => re.test(s);
   }
   const needle = pattern.toLowerCase();
-  return (url) => url.toLowerCase().includes(needle);
+  return (s) => s.toLowerCase().includes(needle);
 }
 
-function safeMatch(pattern, url) {
+function safeMatch(pattern, s) {
   try {
-    return compilePattern(pattern)(url);
+    return compilePattern(pattern)(s);
   } catch {
     return false;
   }
 }
 
-/** Should this finished request be captured at all? */
-function passesFilters(method, url) {
-  const { methods, urlFilter } = state.settings;
-  if (!methods.includes(method)) return false;
-  if (urlFilter.trim() && !safeMatch(urlFilter.trim(), url)) return false;
+/** Does this request match the matching rules (Settings -> Matching rules)? */
+function matchesRules(method, url, responseStatus) {
+  const { ruleMethods, ruleUrlFilter, ruleOkOnly } = state.settings;
+  if (!ruleMethods.includes(method)) return false;
+  if (ruleOkOnly && !(responseStatus >= 200 && responseStatus < 300)) return false;
+  if (ruleUrlFilter.trim() && !safeMatch(ruleUrlFilter.trim(), url)) return false;
   return true;
 }
 
@@ -155,6 +181,18 @@ function resolveSchemaName(url, method) {
   return { name: deriveSchemaName(url, method), source: 'derived' };
 }
 
+/** List view filter. Only changes what is shown, never what is recorded. */
+function isVisible(entry) {
+  const v = state.settings.view;
+  // resourceType is Chrome's "Type" column (fetch, xhr, script, image, …).
+  if (v.apiOnly && entry.resourceType && !['fetch', 'xhr'].includes(entry.resourceType)) return false;
+  if (v.jsonOnly && !entry.hasJson) return false;
+  if (v.method && entry.method !== v.method) return false;
+  const search = v.search.trim();
+  if (search && !safeMatch(search, entry.url) && !safeMatch(search, entry.schemaName)) return false;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // 3. Capture pipeline
 // ---------------------------------------------------------------------------
@@ -169,41 +207,41 @@ const ready = new Promise((r) => (resolveReady = r));
  */
 async function ingest(har) {
   await ready;
-  const { settings } = state;
-  if (!settings.captureEnabled) return;
+  if (!state.settings.captureEnabled) return;
 
-  const method = (har.request.method || '').toUpperCase();
   const url = har.request.url;
-  if (!passesFilters(method, url)) {
-    state.ignored++;
-    renderCounters();
-    return;
-  }
+  if (/^(data|blob|chrome-extension):/.test(url)) return;
+  const method = (har.request.method || '').toUpperCase();
 
   const entry = {
     id: nextId++,
     timestamp: har.startedDateTime || new Date().toISOString(),
     method,
     url,
+    resourceType: har._resourceType || '',
+    responseStatus: har.response ? har.response.status : 0,
+    hasJson: false,
     payload: undefined,
+    rawBody: '',
     schemaName: '',
     schemaSource: '',
-    status: 'pending',
+    flagged: false,
+    status: 'nobody', // 'nobody' | 'new' | 'sending' | 'saved' | 'failed'
     detail: '',
   };
 
-  const text = har.request.postData && har.request.postData.text;
-  if (text === undefined || text === null || text === '') {
-    entry.status = 'skipped';
+  const postData = har.request.postData;
+  const text = postData && postData.text;
+  if (!text) {
     entry.detail = 'No request body';
   } else {
     try {
       entry.payload = JSON.parse(text);
-    } catch (err) {
-      const mime = (har.request.postData && har.request.postData.mimeType) || 'unknown type';
-      entry.status = 'skipped';
-      entry.detail = `Body is not valid JSON (${mime})`;
-      console.warn(`[Payload Capture] Skipped ${method} ${url}: body is not JSON (${mime}).`, err);
+      entry.hasJson = true;
+      entry.status = 'new';
+    } catch {
+      entry.rawBody = text.length > MAX_RAW_BODY ? text.slice(0, MAX_RAW_BODY) + '\n… (truncated)' : text;
+      entry.detail = `Body is not JSON (${(postData && postData.mimeType) || 'unknown type'})`;
     }
   }
 
@@ -211,23 +249,25 @@ async function ingest(har) {
   entry.schemaName = resolved.name;
   entry.schemaSource = resolved.source;
 
+  const ruleHit = entry.hasJson && state.settings.ruleAction !== 'off' && matchesRules(method, url, entry.responseStatus);
+  if (ruleHit && state.settings.ruleAction === 'flag') entry.flagged = true;
+
   addEntry(entry);
 
-  if (entry.status === 'pending' && settings.autoSend) {
-    send(entry);
-  }
+  if (ruleHit && state.settings.ruleAction === 'save') save(entry);
 }
 
-async function send(entry) {
-  if (entry.payload === undefined) return;
+async function save(entry) {
+  if (!entry.hasJson || entry.status === 'sending') return;
   const schemaName = sanitizeSchemaName(entry.schemaName);
   if (!schemaName) {
     setStatus(entry, 'failed', 'Schema name is empty');
     return;
   }
 
+  const outputDir = state.settings.outputDir.trim();
   setStatus(entry, 'sending', '');
-  const endpoint = state.settings.serverUrl.replace(/\/+$/, '') + '/capture';
+  const endpoint = serverBase() + '/capture';
   try {
     const res = await fetch(endpoint, {
       method: 'POST',
@@ -238,18 +278,29 @@ async function send(entry) {
         method: entry.method,
         payload: entry.payload,
         timestamp: entry.timestamp,
+        outputDir: outputDir || undefined,
       }),
     });
     const body = await res.json().catch(() => ({}));
     if (res.ok) {
-      setStatus(entry, 'sent', body.saved ? `→ ${body.saved}` : '');
+      entry.flagged = false;
+      setStatus(entry, 'saved', body.saved ? `→ ${body.saved}` : '');
       setServerStatus(true);
+      rememberOutputDir(outputDir);
     } else {
       setStatus(entry, 'failed', body.error || `HTTP ${res.status}`);
     }
   } catch (err) {
-    setStatus(entry, 'failed', `Cannot reach ${endpoint} — is the capture server running? (${err.message})`);
+    setStatus(entry, 'failed', `Cannot reach ${endpoint}. Is the capture server running? (${err.message})`);
     setServerStatus(false);
+  }
+}
+
+/** Oldest first and one at a time, so history files keep the request order. */
+async function saveFlagged() {
+  const flagged = state.entries.filter((e) => e.flagged).reverse();
+  for (const entry of flagged) {
+    await save(entry);
   }
 }
 
@@ -257,11 +308,19 @@ async function send(entry) {
 window.payloadCapture = { ingest };
 
 // ---------------------------------------------------------------------------
-// 4. Captured-requests list UI
+// 4. Request list UI
 // ---------------------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
 const rowEls = new Map(); // entry.id -> { row, detailRow }
+
+const STATUS_LABELS = {
+  nobody: '',
+  new: 'not saved',
+  sending: 'saving…',
+  saved: 'saved',
+  failed: 'failed',
+};
 
 function addEntry(entry) {
   state.entries.unshift(entry);
@@ -288,10 +347,23 @@ function createRow(entry) {
   const row = $('captureRowTemplate').content.firstElementChild.cloneNode(true);
   const els = { row, detailRow: null };
 
+  row.classList.toggle('no-json', !entry.hasJson);
+
+  const flag = row.querySelector('.flag');
+  flag.addEventListener('change', () => {
+    entry.flagged = flag.checked;
+    renderCounters();
+  });
+
   row.querySelector('.col-time').textContent = formatTime(entry.timestamp);
   row.querySelector('.col-time').title = entry.timestamp;
-  row.querySelector('.col-method').textContent = entry.method;
-  row.querySelector('.col-method').className = `col-method method-${entry.method.toLowerCase()}`;
+  const methodCell = row.querySelector('.col-method');
+  methodCell.textContent = entry.method;
+  methodCell.classList.add(`method-${entry.method.toLowerCase()}`);
+  const code = row.querySelector('.col-code');
+  code.textContent = entry.responseStatus || '';
+  code.classList.toggle('code-error', entry.responseStatus >= 400 || entry.responseStatus === 0);
+  code.title = entry.resourceType ? `type: ${entry.resourceType}` : '';
   const urlText = row.querySelector('.url-text');
   urlText.textContent = entry.url;
   urlText.title = entry.url;
@@ -304,10 +376,10 @@ function createRow(entry) {
     updateRow(entry);
   });
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && entry.payload !== undefined) send(entry);
+    if (e.key === 'Enter') save(entry);
   });
 
-  row.querySelector('.send-btn').addEventListener('click', () => send(entry));
+  row.querySelector('.send-btn').addEventListener('click', () => save(entry));
   row.querySelector('.map-btn').addEventListener('click', () => addMappingFromEntry(entry));
   row.querySelector('.view-btn').addEventListener('click', () => toggleDetail(entry, els));
 
@@ -319,9 +391,16 @@ function updateRow(entry, els = rowEls.get(entry.id)) {
   if (!els) return;
   const { row } = els;
   row.dataset.status = entry.status;
+  row.hidden = !isVisible(entry);
+  if (els.detailRow) els.detailRow.hidden = row.hidden;
+
+  const flag = row.querySelector('.flag');
+  flag.checked = entry.flagged;
+  flag.disabled = !entry.hasJson || entry.status === 'sending';
+  flag.title = entry.hasJson ? 'Flag to save with "Save flagged"' : 'Only requests with a JSON body can be saved';
 
   const status = row.querySelector('.status');
-  status.textContent = entry.status;
+  status.textContent = STATUS_LABELS[entry.status];
   status.className = `status status-${entry.status}`;
   const detail = row.querySelector('.status-detail');
   detail.textContent = entry.detail;
@@ -332,16 +411,22 @@ function updateRow(entry, els = rowEls.get(entry.id)) {
     entry.schemaSource + (preview !== entry.schemaName ? ` · saves as ${preview || '(invalid)'}` : '');
 
   const sendBtn = row.querySelector('.send-btn');
-  const hasPayload = entry.payload !== undefined;
-  sendBtn.disabled = !hasPayload || entry.status === 'sending';
-  sendBtn.textContent = entry.status === 'sent' || entry.status === 'failed' ? 'Resend' : 'Send';
-  row.querySelector('.view-btn').disabled = !hasPayload;
+  sendBtn.disabled = !entry.hasJson || entry.status === 'sending';
+  sendBtn.textContent = entry.status === 'saved' || entry.status === 'failed' ? 'Save again' : 'Save';
+  row.querySelector('.view-btn').disabled = !entry.hasJson && !entry.rawBody;
 }
 
-/** After a mapping change, rename rows that haven't been sent or hand-edited. */
-function reresolveUnsent() {
+function setStatus(entry, status, detail) {
+  entry.status = status;
+  entry.detail = detail;
+  updateRow(entry);
+  renderCounters();
+}
+
+/** After a mapping change, rename rows that haven't been saved or hand-edited. */
+function reresolveUnsaved() {
   for (const entry of state.entries) {
-    if (entry.schemaSource === 'edited' || !['pending', 'skipped', 'failed'].includes(entry.status)) continue;
+    if (entry.schemaSource === 'edited' || entry.status === 'saved' || entry.status === 'sending') continue;
     const resolved = resolveSchemaName(entry.url, entry.method);
     entry.schemaName = resolved.name;
     entry.schemaSource = resolved.source;
@@ -351,10 +436,8 @@ function reresolveUnsent() {
   }
 }
 
-function setStatus(entry, status, detail) {
-  entry.status = status;
-  entry.detail = detail;
-  updateRow(entry);
+function applyView() {
+  for (const entry of state.entries) updateRow(entry);
   renderCounters();
 }
 
@@ -367,9 +450,9 @@ function toggleDetail(entry, els) {
   const tr = document.createElement('tr');
   tr.className = 'detail-row';
   const td = document.createElement('td');
-  td.colSpan = 6;
+  td.colSpan = 8;
   const pre = document.createElement('pre');
-  pre.textContent = JSON.stringify(entry.payload, null, 2);
+  pre.textContent = entry.hasJson ? JSON.stringify(entry.payload, null, 2) : entry.rawBody;
   td.appendChild(pre);
   tr.appendChild(td);
   els.row.after(tr);
@@ -377,21 +460,108 @@ function toggleDetail(entry, els) {
 }
 
 function renderCounters() {
-  const counts = { sent: 0, failed: 0, skipped: 0, pending: 0 };
+  let shown = 0;
+  let flagged = 0;
+  let saved = 0;
+  let failed = 0;
+  let visibleSavable = 0;
+  let visibleFlagged = 0;
   for (const e of state.entries) {
-    if (e.status in counts) counts[e.status]++;
+    const visible = isVisible(e);
+    if (visible) shown++;
+    if (e.flagged) flagged++;
+    if (e.status === 'saved') saved++;
+    if (e.status === 'failed') failed++;
+    if (visible && e.hasJson && e.status !== 'sending') {
+      visibleSavable++;
+      if (e.flagged) visibleFlagged++;
+    }
   }
   $('counters').textContent =
-    `${counts.sent} sent · ${counts.failed} failed · ${counts.skipped} skipped · ` +
-    `${counts.pending} pending · ${state.ignored} ignored by filters`;
-  $('sendPending').disabled = counts.pending === 0;
-  $('emptyHint').classList.toggle('hidden', state.entries.length > 0);
+    `showing ${shown} of ${state.entries.length} · ${saved} saved` + (failed ? ` · ${failed} failed` : '');
+  $('saveFlagged').textContent = `Save flagged (${flagged})`;
+  $('saveFlagged').disabled = flagged === 0;
+  $('unflagAll').disabled = flagged === 0;
+
+  const all = $('flagAll');
+  all.disabled = visibleSavable === 0;
+  all.checked = visibleSavable > 0 && visibleFlagged === visibleSavable;
+  all.indeterminate = visibleFlagged > 0 && visibleFlagged < visibleSavable;
+
+  $('emptyHint').classList.toggle('hidden', shown > 0);
+  $('emptyHint').textContent =
+    state.entries.length === 0
+      ? 'No requests yet. Use the inspected page and its requests appear here.'
+      : `${state.entries.length} request(s) hidden by the view filters above.`;
 }
 
 function formatTime(iso) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleTimeString([], { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+
+function initList() {
+  $('saveFlagged').addEventListener('click', saveFlagged);
+  $('unflagAll').addEventListener('click', () => {
+    for (const e of state.entries) e.flagged = false;
+    applyView();
+  });
+  $('flagAll').addEventListener('change', () => {
+    const value = $('flagAll').checked;
+    for (const e of state.entries) {
+      if (e.hasJson && e.status !== 'sending' && isVisible(e)) e.flagged = value;
+    }
+    applyView();
+  });
+  $('clearList').addEventListener('click', () => {
+    for (const e of state.entries) removeRow(e.id);
+    state.entries = [];
+    renderCounters();
+  });
+
+  // View filters.
+  const v = state.settings.view;
+  const search = $('viewSearch');
+  search.value = v.search;
+  search.addEventListener('input', () => {
+    v.search = search.value;
+    search.classList.toggle('invalid', Boolean(patternError(search.value.trim())));
+    saveSettings();
+    applyView();
+  });
+
+  const methodSelect = $('viewMethod');
+  for (const m of ['', ...ALL_METHODS]) {
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = m || 'All methods';
+    methodSelect.appendChild(o);
+  }
+  methodSelect.value = v.method;
+  methodSelect.addEventListener('change', () => {
+    v.method = methodSelect.value;
+    saveSettings();
+    applyView();
+  });
+
+  for (const [id, key] of [['viewApiOnly', 'apiOnly'], ['viewJsonOnly', 'jsonOnly']]) {
+    const cb = $(id);
+    cb.checked = v[key];
+    cb.addEventListener('change', () => {
+      v[key] = cb.checked;
+      saveSettings();
+      applyView();
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Output folder + server status
+// ---------------------------------------------------------------------------
+
+function serverBase() {
+  return state.settings.serverUrl.replace(/\/+$/, '');
 }
 
 function setServerStatus(ok, text) {
@@ -401,21 +571,76 @@ function setServerStatus(ok, text) {
 }
 
 async function testServer() {
-  const url = state.settings.serverUrl.replace(/\/+$/, '') + '/health';
   const el = $('serverStatus');
   el.className = 'server-status unknown';
   el.textContent = 'server: checking…';
   try {
-    const res = await fetch(url);
+    const res = await fetch(serverBase() + '/health');
     const body = await res.json();
     setServerStatus(res.ok && body.status === 'ok');
   } catch (err) {
     setServerStatus(false, `server: unreachable (${err.message})`);
   }
+  checkOutputDir();
+}
+
+/** Ask the server where the folder setting resolves to, and show it. */
+async function checkOutputDir() {
+  const hint = $('outputDirHint');
+  const dir = state.settings.outputDir.trim();
+  try {
+    const res = await fetch(`${serverBase()}/config?outputDir=${encodeURIComponent(dir)}`);
+    const body = await res.json();
+    $('outputDir').placeholder = `server default: ${body.defaultOutputDir}`;
+    hint.textContent = `→ ${body.outputDir}${body.exists ? '' : ' (new folder, created on first save)'}`;
+    hint.title = body.flat ? 'Server runs in --flat mode: files are overwritten' : 'History mode: earlier captures are kept';
+    hint.className = 'dir-hint';
+  } catch {
+    hint.textContent = 'Start the server to see where files will go';
+    hint.className = 'dir-hint muted';
+  }
+}
+
+function rememberOutputDir(dir) {
+  if (!dir) return;
+  const recent = state.settings.recentOutputDirs.filter((d) => d !== dir);
+  recent.unshift(dir);
+  state.settings.recentOutputDirs = recent.slice(0, MAX_RECENT_DIRS);
+  saveSettings();
+  renderRecentDirs();
+}
+
+function renderRecentDirs() {
+  const list = $('recentDirs');
+  list.textContent = '';
+  for (const dir of state.settings.recentOutputDirs) {
+    const o = document.createElement('option');
+    o.value = dir;
+    list.appendChild(o);
+  }
+}
+
+function initOutputDir() {
+  const input = $('outputDir');
+  input.value = state.settings.outputDir;
+  renderRecentDirs();
+  let timer = null;
+  input.addEventListener('input', () => {
+    state.settings.outputDir = input.value;
+    saveSettings();
+    clearTimeout(timer);
+    timer = setTimeout(checkOutputDir, 300);
+  });
+  $('resetOutputDir').addEventListener('click', () => {
+    input.value = '';
+    state.settings.outputDir = '';
+    saveSettings();
+    checkOutputDir();
+  });
 }
 
 // ---------------------------------------------------------------------------
-// 5. Settings + mappings UI
+// 6. Settings + mappings UI
 // ---------------------------------------------------------------------------
 
 function initToolbar() {
@@ -426,23 +651,14 @@ function initToolbar() {
     saveSettings();
   });
 
-  const autoSend = $('autoSend');
-  autoSend.checked = state.settings.autoSend;
-  autoSend.addEventListener('change', () => {
-    state.settings.autoSend = autoSend.checked;
+  const action = $('ruleAction');
+  action.value = state.settings.ruleAction;
+  action.addEventListener('change', () => {
+    state.settings.ruleAction = action.value;
     saveSettings();
   });
 
   $('testServer').addEventListener('click', testServer);
-  $('sendPending').addEventListener('click', () => {
-    state.entries.filter((e) => e.status === 'pending').forEach(send);
-  });
-  $('clearList').addEventListener('click', () => {
-    for (const e of state.entries) removeRow(e.id);
-    state.entries = [];
-    state.ignored = 0;
-    renderCounters();
-  });
 }
 
 function initSettings() {
@@ -455,31 +671,38 @@ function initSettings() {
     testServer();
   });
 
-  const methodBox = $('methodFilters');
+  const methodBox = $('ruleMethods');
   for (const method of ALL_METHODS) {
     const label = document.createElement('label');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.value = method;
-    cb.checked = state.settings.methods.includes(method);
+    cb.checked = state.settings.ruleMethods.includes(method);
     cb.addEventListener('change', () => {
-      state.settings.methods = [...methodBox.querySelectorAll('input:checked')].map((c) => c.value);
+      state.settings.ruleMethods = [...methodBox.querySelectorAll('input:checked')].map((c) => c.value);
       saveSettings();
     });
     label.append(cb, ' ', method);
     methodBox.appendChild(label);
   }
 
-  const urlFilter = $('urlFilter');
-  urlFilter.value = state.settings.urlFilter;
+  const okOnly = $('ruleOkOnly');
+  okOnly.checked = state.settings.ruleOkOnly;
+  okOnly.addEventListener('change', () => {
+    state.settings.ruleOkOnly = okOnly.checked;
+    saveSettings();
+  });
+
+  const urlFilter = $('ruleUrlFilter');
+  urlFilter.value = state.settings.ruleUrlFilter;
   const validate = () => {
     const err = patternError(urlFilter.value.trim());
-    $('urlFilterError').textContent = err;
-    $('urlFilterError').classList.toggle('hidden', !err);
+    $('ruleUrlFilterError').textContent = err;
+    $('ruleUrlFilterError').classList.toggle('hidden', !err);
     urlFilter.classList.toggle('invalid', Boolean(err));
   };
   urlFilter.addEventListener('input', () => {
-    state.settings.urlFilter = urlFilter.value;
+    state.settings.ruleUrlFilter = urlFilter.value;
     validate();
     saveSettings();
   });
@@ -584,7 +807,7 @@ function moveMapping(index, delta) {
   renderMappings();
 }
 
-/** "+ Map" on a captured row: new mapping at the top for that URL path + method. */
+/** "+ Map" on a row: new mapping at the top for that URL path + method. */
 function addMappingFromEntry(entry) {
   let pattern = entry.url;
   try {
@@ -666,6 +889,8 @@ function applyTheme() {
   applyTheme();
   await loadState();
   initToolbar();
+  initOutputDir();
+  initList();
   initSettings();
   initMappings();
   renderCounters();

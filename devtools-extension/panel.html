@@ -6,72 +6,110 @@
     <link rel="stylesheet" href="panel.css" />
   </head>
   <body>
-    <header class="toolbar">
-      <label class="switch" title="Pause/resume capturing without closing DevTools">
-        <input type="checkbox" id="captureEnabled" />
-        <span class="slider"></span>
-        <span class="switch-label">Capture</span>
-      </label>
-      <label class="switch" title="Send matching requests to the server immediately. Turn off to review/rename before sending.">
-        <input type="checkbox" id="autoSend" />
-        <span class="slider"></span>
-        <span class="switch-label">Auto-send</span>
-      </label>
+    <header class="sticky">
+      <div class="toolbar">
+        <label class="switch" title="Pause/resume recording requests without closing DevTools">
+          <input type="checkbox" id="captureEnabled" />
+          <span class="slider"></span>
+          <span class="switch-label">Record</span>
+        </label>
 
-      <span class="sep"></span>
+        <label class="inline" title="What to do with JSON requests that match the rules in Settings → Matching rules">
+          Matching rules:
+          <select id="ruleAction">
+            <option value="off">do nothing</option>
+            <option value="flag">flag them</option>
+            <option value="save">save them immediately</option>
+          </select>
+        </label>
 
-      <button id="testServer" title="GET /health on the capture server">Test server</button>
-      <span id="serverStatus" class="server-status unknown">server: ?</span>
+        <span class="sep"></span>
 
-      <span class="spacer"></span>
+        <label class="inline output-dir" title="Folder the server writes to. Absolute, ~/…, or relative to the server's default folder. Leave empty for the default.">
+          Save to:
+          <input type="text" id="outputDir" list="recentDirs" spellcheck="false" />
+          <datalist id="recentDirs"></datalist>
+          <button id="resetOutputDir" class="icon" title="Use the server default">✕</button>
+        </label>
 
-      <span id="counters" class="counters"></span>
-      <button id="sendPending" title="Send every pending row">Send pending</button>
-      <button id="clearList">Clear list</button>
+        <span class="spacer"></span>
+
+        <button id="testServer" title="GET /health on the capture server">Test server</button>
+        <span id="serverStatus" class="server-status unknown">server: ?</span>
+      </div>
+      <div class="toolbar sub">
+        <span id="outputDirHint" class="dir-hint muted"></span>
+      </div>
+      <div class="toolbar filters">
+        <input type="text" id="viewSearch" placeholder="Filter URL or schema (text or re:…)" spellcheck="false" />
+        <select id="viewMethod"></select>
+        <label class="inline"><input type="checkbox" id="viewApiOnly" /> Fetch/XHR only</label>
+        <label class="inline"><input type="checkbox" id="viewJsonOnly" /> JSON body only</label>
+        <span id="counters" class="counters"></span>
+
+        <span class="spacer"></span>
+
+        <button id="saveFlagged" class="primary">Save flagged (0)</button>
+        <button id="unflagAll">Unflag all</button>
+        <button id="clearList">Clear list</button>
+      </div>
     </header>
 
     <main>
       <table class="captures">
         <thead>
           <tr>
+            <th class="col-flag"><input type="checkbox" id="flagAll" title="Flag / unflag every visible request that has a JSON body" /></th>
             <th class="col-time">Time</th>
             <th class="col-method">Method</th>
+            <th class="col-code">Code</th>
             <th class="col-url">URL</th>
             <th class="col-schema">Schema name</th>
-            <th class="col-status">Status</th>
+            <th class="col-status">Saved?</th>
             <th class="col-actions"></th>
           </tr>
         </thead>
         <tbody id="captureRows"></tbody>
       </table>
-      <p id="emptyHint" class="empty-hint">
-        No captured requests yet. Trigger a POST/PUT/PATCH in the inspected page.
-        Requests that don't match the method / URL filters below are ignored.
-      </p>
+      <p id="emptyHint" class="empty-hint"></p>
     </main>
 
-    <details id="settingsSection" class="section" open>
+    <details id="settingsSection" class="section">
       <summary>Settings</summary>
       <div class="form-grid">
         <label for="serverUrl">Capture server URL</label>
         <div>
           <input type="text" id="serverUrl" placeholder="http://127.0.0.1:4545" spellcheck="false" />
-          <small>Must be 127.0.0.1 or localhost (any port) — see manifest host_permissions.</small>
+          <small>Must be 127.0.0.1 or localhost (any port). See host_permissions in the manifest.</small>
+        </div>
+
+        <label>Matching rules</label>
+        <div>
+          <small class="lead">
+            A request with a JSON body matches when it has one of these methods, its response is 2xx (if checked),
+            <b>and</b> its URL matches the filter.
+            The "Matching rules" menu in the toolbar sets what happens to matches.
+          </small>
         </div>
 
         <label>Methods</label>
-        <div id="methodFilters" class="checkbox-row"></div>
+        <div id="ruleMethods" class="checkbox-row"></div>
 
-        <label for="urlFilter">URL filter</label>
+        <label for="ruleOkOnly">Responses</label>
+        <div class="checkbox-row">
+          <label><input type="checkbox" id="ruleOkOnly" /> Only successful (2xx) responses</label>
+        </div>
+
+        <label for="ruleUrlFilter">URL filter</label>
         <div>
-          <input type="text" id="urlFilter" placeholder="e.g. /api/  or  re:/v\d+/(users|orders)" spellcheck="false" />
+          <input type="text" id="ruleUrlFilter" placeholder="e.g. localhost:3000/api/  or  re:/v\d+/(users|orders)" spellcheck="false" />
           <small>Empty = all URLs. Plain text = substring match, <code>re:</code> prefix = regex. Case-insensitive.</small>
-          <small id="urlFilterError" class="error hidden"></small>
+          <small id="ruleUrlFilterError" class="error hidden"></small>
         </div>
       </div>
     </details>
 
-    <details id="mappingsSection" class="section" open>
+    <details id="mappingsSection" class="section">
       <summary>Mappings (URL pattern → schema name)</summary>
       <p class="help">
         Checked top to bottom against the full request URL; first match wins. Plain text = substring,
@@ -107,8 +145,10 @@
 
     <template id="captureRowTemplate">
       <tr class="capture-row">
+        <td class="col-flag"><input type="checkbox" class="flag" /></td>
         <td class="col-time"></td>
         <td class="col-method"></td>
+        <td class="col-code"></td>
         <td class="col-url"><span class="url-text"></span></td>
         <td class="col-schema">
           <input type="text" class="schema-input" spellcheck="false" />
@@ -116,9 +156,9 @@
         </td>
         <td class="col-status"><span class="status"></span><div class="status-detail"></div></td>
         <td class="col-actions">
-          <button class="send-btn">Send</button>
+          <button class="send-btn" title="Save this request now">Save</button>
           <button class="map-btn" title="Add a mapping row for this URL + method using the current schema name">+ Map</button>
-          <button class="view-btn" title="Show payload">{ }</button>
+          <button class="view-btn" title="Show request body">{ }</button>
         </td>
       </tr>
     </template>
