@@ -196,9 +196,26 @@ You can add them in three ways:
   In JSON, write a regex backslash as `\\`. For example, `"re:/v\\d+/users"`.
 - **As new defaults**: edit `default-mappings.js`, reload the extension, and click **Reset to defaults**. The file is read only on first run and on reset.
 
+## Page capture (fetch and Axios from inside the page)
+
+The panel has two sources of requests:
+
+1. **DevTools**: what Chrome's Network tab gives to extensions. This is the default source, and it covers all request types.
+2. **Page capture**: a small script (`page-hook.js`) that runs inside your app's page. It wraps `fetch()` and `XMLHttpRequest`, which Axios uses. It copies each request body when your code sends it, and copies the response body when it arrives. It does not change what your app sends or receives.
+
+Page capture exists because on some machines Chrome does not give every request to extensions. A typical symptom is that the preflight (`OPTIONS`, 204) of a cross-origin call is in the list, but the `POST` itself is not. Page capture does not depend on DevTools, so it records such a `POST` anyway.
+
+- Page capture is on by default. To turn it off, open **Settings** and clear **Page capture**.
+- It works for apps that run on `localhost` or `127.0.0.1`, over `http` or `https`, on any port. It records calls to any API, for example a deployed service on another domain.
+- After you install or update the extension, **reload your app's page**. Chrome adds the script only when a page loads.
+- Rows from page capture have a **page** mark next to the method. When both sources see the same request, the list keeps only the first copy.
+- Page capture copies bodies up to 5 MB. It copies response bodies only for text and JSON. It cannot copy a body that the app sends as a stream (`ReadableStream`).
+- To use page capture on another host, for example `http://myapp.test:3000`, add the host to both `content_scripts` entries in `manifest.json` (for example `"http://myapp.test/*"`) and reload the extension.
+
 ## Manifest notes
 
-- `manifest.json` uses only the `storage` permission. `chrome.devtools.network` needs no host permissions to read the inspected page's requests.
+- `manifest.json` uses the `storage` permission. `chrome.devtools.network` needs no host permissions to read the inspected page's requests.
+- The two `content_scripts` entries are for page capture: `page-hook.js` runs in the page's own JavaScript world (`"world": "MAIN"`, which needs Chrome 111 or later), and `page-bridge.js` sends its results to the panel.
 - `host_permissions` has only `http://127.0.0.1/*` and `http://localhost/*`, which the panel needs for its `fetch()` to the server. These Chrome match patterns have no port, so they **match any port**. If you change the server port, you do not need to edit the manifest. You change only the URL in the panel settings. (JSON does not allow comments, so this note is here and not in `manifest.json`.)
 - If the server runs on a different host, add that origin to `host_permissions` and reload the extension.
 
@@ -218,6 +235,7 @@ This matters because a save request chooses its own output folder. If the server
 | Mapping match rules                      | `devtools-extension/panel.js`: `compilePattern()`, `resolveSchemaName()` |
 | Fallback name from the URL               | `devtools-extension/panel.js`: `deriveSchemaName()`, `isIdLike()` |
 | How request and response bodies are read | `devtools-extension/panel.js`: `parseRequestBody()`, `loadResponseBody()` |
+| Page capture (fetch/XHR inside the page) | `devtools-extension/page-hook.js`; hosts in `manifest.json` → `content_scripts` |
 | File name suffix for response bodies     | `devtools-extension/panel.js`: `RESPONSE_SUFFIX` |
 | Default mapping rows                     | `devtools-extension/default-mappings.js` |
 | File names, history and flat behavior    | `capture-server/src/storage.js` |
@@ -255,7 +273,7 @@ If a call from your frontend to your backend is not in the list, do these checks
 
 1. **Is the call in Chrome's own Network tab?**
    - **No, it is not.** The extension cannot see it either. Usually DevTools was opened after the call. Keep DevTools open and reload the page, or repeat the action. Also make sure that DevTools is open on the correct tab. A popup window or a new tab (for example, a login flow) has its own DevTools.
-   - **Yes, it is.** Click **Sync from Network tab**. If the call then appears, something removed it from the list before. Send a report (refer to [Help to find a problem](#help-to-find-a-problem)), because this should not happen.
+   - **Yes, it is.** Make sure that [page capture](#page-capture-fetch-and-axios-from-inside-the-page) is on, reload your app's page, and do the action again. If the call is still missing, click **Sync from Network tab**. If the call then appears, something removed it from the list before. Send a report (refer to [Help to find a problem](#help-to-find-a-problem)), because this should not happen.
 2. **Does the counter show "showing X of Y" with X less than Y?** The view filters hide some rows. Clear the search box, set the method menu to *All methods*, and turn off **Savable only** and **Hide static files**.
 3. **Is Record on?** While it is off, new requests are not recorded. **Sync from Network tab** still adds them.
 4. **Does the frontend call the backend through WebSockets** (Socket.IO, GraphQL subscriptions and similar)? WebSocket messages are not HTTP requests, so they are not captured. Only the first connection request shows.

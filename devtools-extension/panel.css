@@ -148,7 +148,7 @@ th { color: var(--muted); font-weight: 600; background: var(--bg); }
 .col-code { width: 44px; font-family: ui-monospace, Menlo, Consolas, monospace; }
 .code-error { color: var(--err); }
 .col-time { width: 95px; font-family: ui-monospace, Menlo, Consolas, monospace; }
-.col-method { width: 62px; font-weight: 700; }
+.col-method { width: 92px; font-weight: 700; }
 .col-schema { width: 230px; }
 .col-status { width: 200px; }
 .col-actions { width: 170px; white-space: nowrap; }
@@ -188,6 +188,18 @@ th { color: var(--muted); font-weight: 600; background: var(--bg); }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Rows recorded by page capture (page-hook.js) instead of DevTools. */
+.page-badge,
+.capture-row.from-page .col-method::after {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+.capture-row.from-page .col-method::after { content: 'page'; margin-left: 4px; vertical-align: 1px; }
 
 .detail-row td { background: var(--bg-alt); }
 .detail-grid {
