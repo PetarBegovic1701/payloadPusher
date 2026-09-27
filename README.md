@@ -53,7 +53,9 @@ When you edit the extension code, click the reload icon on the extension card. T
 7. Correct the **Schema name** if necessary. This is the file name.
 8. Click **Save flagged (N)**. Each row changes to **SAVED** and shows the path it was written to. To save one row immediately, click **Save** on that row (or press Enter in its name field).
 
-The extension starts to record when DevTools opens, not when you click the panel. It keeps requests from before your first click on the panel (up to 1000) and lists them when the panel opens. It does not see requests from before DevTools opened.
+The extension starts to record when DevTools opens, not when you click the panel. When the panel opens, it also reads everything that the Network tab has already recorded. It does not see requests from before DevTools opened, so open DevTools first and then reload the page.
+
+The list keeps up to 5000 requests. Static files (scripts, styles, images and similar) have a separate limit of 300 and are dropped first. This is so that a dev server that loads hundreds of source files per page cannot push API calls out of the list.
 
 ### The panel
 
@@ -72,10 +74,11 @@ The extension starts to record when DevTools opens, not when you click the panel
 | ------- | ------------ |
 | Search box | Filters by URL or schema name. Plain text is a substring match; `re:` is a regex. |
 | Method menu | Shows only one method. |
-| **Fetch/XHR only** (on by default) | Hides documents, scripts, images, fonts and preflights. This is the same as Chrome's "Fetch/XHR" filter. |
+| **Hide static files** (on by default) | Hides scripts, styles, images, fonts, media, preflights and page loads. It shows all other types, for example `fetch`, `xhr`, `ping` (`sendBeacon`), `eventsource` and `other`. A form POST is not hidden. Hover over the **Code** cell to see Chrome's type. |
 | **JSON body only** | Hides requests that you cannot save. |
 | **Save flagged (N)** | Saves all flagged rows, including rows that the filters hide. It saves them oldest first, so history files stay in request order. |
 | **Unflag all**, header check box | Clears all flags. The header box flags or unflags every visible row that can be saved. |
+| **Sync from Network tab** | Adds each request from the Network tab's log that the list does not have yet, and skips duplicates. It adds requests even when **Record** is off. If the matching rules are set to *save them immediately*, a sync only flags the requests. |
 
 **Rows**
 
@@ -190,10 +193,24 @@ This matters because a save request chooses its own output folder. If the server
 | ---------------------------------------- | ---- |
 | Which requests are auto-flagged/saved    | `devtools-extension/panel.js`: `matchesRules()` |
 | What the list shows                      | `devtools-extension/panel.js`: `isVisible()` |
+| What counts as a static file             | `devtools-extension/request-types.js`: `isStaticRequest()` |
 | Mapping match rules                      | `devtools-extension/panel.js`: `compilePattern()`, `resolveSchemaName()` |
 | Fallback name from the URL               | `devtools-extension/panel.js`: `deriveSchemaName()`, `isIdLike()` |
 | Default mapping rows                     | `devtools-extension/default-mappings.js` |
 | File names, history and flat behavior    | `capture-server/src/storage.js` |
+
+## Missing API calls
+
+If a call from your frontend to your backend is not in the list, do these checks in this order:
+
+1. **Is the call in Chrome's own Network tab?**
+   - **No, it is not.** The extension cannot see it either. Usually DevTools was opened after the call. Keep DevTools open and reload the page, or repeat the action. Also make sure that DevTools is open on the correct tab. A popup window or a new tab (for example, a login flow) has its own DevTools.
+   - **Yes, it is.** Click **Sync from Network tab**. If the call then appears, something removed it from the list before. Tell the maintainer, because this should not happen.
+2. **Does the counter show "showing X of Y" with X less than Y?** The view filters hide some rows. Clear the search box, set the method menu to *All methods*, and turn off **JSON body only** and **Hide static files**.
+3. **Is Record on?** While it is off, new requests are not recorded. **Sync from Network tab** still adds them.
+4. **Does the frontend call the backend through WebSockets** (Socket.IO, GraphQL subscriptions and similar)? WebSocket messages are not HTTP requests, so they are not captured. Only the first connection request shows.
+5. **Does the backend make the call, not the browser?** The browser cannot see server-to-server calls. Refer to [Using it with an app that runs on your computer](#using-it-with-an-app-that-runs-on-your-computer).
+6. **Does a service worker handle the call** (Mock Service Worker, Workbox, a PWA)? Chrome records the page's request. A request that the service worker itself sends to the backend can be missing from the page's log.
 
 ## Troubleshooting
 
@@ -201,5 +218,5 @@ This matters because a save request chooses its own output folder. If the server
 - **The extension's toolbar button does nothing useful**: this is correct. The extension works inside DevTools. The toolbar button only opens a short help popup, which also shows whether the capture server runs.
 - **Every row FAILED "Cannot reach …"**: the server is not running, or the port in *Capture server URL* is not the server's port.
 - **FAILED "Origin not allowed"**: a request came from outside the extension. Refer to the [Security note](#security-note).
-- **Requests do not appear**: check that **Record** is on. The counter shows "showing X of Y". If X is less than Y, the view filters hide some rows. Turn off **Fetch/XHR only** to see all resource types.
+- **Requests do not appear**: refer to [Missing API calls](#missing-api-calls).
 - **No check box on a row**: the request has no JSON body. It is form data, multipart, plain text, or has no body. Only JSON bodies can be saved.
