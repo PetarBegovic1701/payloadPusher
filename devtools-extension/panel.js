@@ -59,7 +59,19 @@ const state = {
   staticCount: 0,
   dropped: 0, // non-static rows removed because of MAX_ROWS
   batching: false,
+  events: [], // every request Chrome delivered and what the panel did with it (for diagnostics)
+  errors: [], // uncaught errors in the panel (for diagnostics)
 };
+
+const MAX_EVENTS = 500;
+const MAX_ERRORS = 50;
+
+function recordError(where, err) {
+  state.errors.push({ at: new Date().toISOString(), where, message: String((err && err.stack) || err).slice(0, 600) });
+  if (state.errors.length > MAX_ERRORS) state.errors.shift();
+}
+window.addEventListener('error', (e) => recordError('window.onerror', e.error || e.message));
+window.addEventListener('unhandledrejection', (e) => recordError('unhandledrejection', e.reason));
 
 async function loadState() {
   const stored = await chrome.storage.local.get(['settings', 'mappings']);
@@ -362,15 +374,83 @@ const ready = new Promise((r) => (resolveReady = r));
  *   ignores the Record switch, and "save them immediately" only flags it, so
  *   a sync never saves a pile of old requests by surprise.
  * Returns true if a row was added.
+ *
+ * Never fails silently: every request is logged in state.events with what
+ * happened to it, and if reading it throws, a row with the error is shown.
  */
 async function ingest(har, options = {}) {
   await ready;
-  if (!state.settings.captureEnabled && !options.backfill) return false;
+  const ctx = { entry: null };
+  let outcome;
+  try {
+    outcome = await ingestRequest(har, options, ctx);
+  } catch (err) {
+    outcome = `error: ${err && err.message}`;
+    recordError('ingest', err);
+    showIngestError(har, err, ctx);
+  }
+  logEvent(har, options.backfill ? 'sync' : 'live', outcome);
+  return outcome === 'added';
+}
+
+function logEvent(har, source, outcome) {
+  const req = (har && har.request) || {};
+  state.events.push({
+    at: new Date().toISOString(),
+    source,
+    method: req.method,
+    chromeType: har && har._resourceType,
+    status: har && har.response ? har.response.status : undefined,
+    url: redactUrl(String(req.url || '')),
+    hasPostData: Boolean(req.postData),
+    outcome,
+  });
+  if (state.events.length > MAX_EVENTS) state.events.shift();
+}
+
+/** Something threw while reading a request: show it as a row instead of dropping it. */
+function showIngestError(har, err, ctx) {
+  const message = `Error while reading this request: ${err && err.message}. Use "Copy diagnostics".`;
+  if (ctx.entry) {
+    // The row exists; show the error on it.
+    ctx.entry.request = noBody(message);
+    ctx.entry.response = noBody('');
+    updateRow(ctx.entry);
+    return;
+  }
+  try {
+    const req = (har && har.request) || {};
+    const timestamp = (har && har.startedDateTime) || new Date().toISOString();
+    addEntry({
+      id: nextId++,
+      timestamp,
+      time: Date.parse(timestamp) || Date.now(),
+      isStatic: false,
+      method: String(req.method || '?').toUpperCase(),
+      url: String(req.url || '(unknown URL)'),
+      resourceType: (har && har._resourceType) || '',
+      responseStatus: har && har.response ? har.response.status : 0,
+      request: noBody(message),
+      response: noBody(''),
+      schemaName: '',
+      schemaSource: '',
+      flagged: false,
+      saves: { request: { status: '', detail: '' }, response: { status: '', detail: '' } },
+      diag: { error: String(err && err.message) },
+    });
+  } catch (err2) {
+    recordError('showIngestError', err2);
+  }
+}
+
+/** Returns what happened: 'added', 'duplicate', 'record off' or 'skipped: …'. */
+async function ingestRequest(har, options, ctx) {
+  if (!state.settings.captureEnabled && !options.backfill) return 'record off';
 
   const url = har.request.url;
-  if (/^(data|blob|chrome-extension):/.test(url)) return false;
+  if (/^(data|blob|chrome-extension):/.test(url)) return 'skipped: data/blob/extension URL';
   const key = requestKey(har);
-  if (state.seen.has(key)) return false;
+  if (state.seen.has(key)) return 'duplicate';
   state.seen.add(key);
   const method = (har.request.method || '').toUpperCase();
   const timestamp = har.startedDateTime || new Date().toISOString();
@@ -401,6 +481,7 @@ async function ingest(har, options = {}) {
   entry.schemaSource = resolved.source;
 
   addEntry(entry);
+  ctx.entry = entry;
 
   if (!isStatic) {
     entry.response = await loadResponseBody(har);
@@ -417,7 +498,7 @@ async function ingest(har, options = {}) {
     if (!state.batching) renderCounters();
   }
   if (ruleHit && action === 'save') save(entry);
-  return true;
+  return 'added';
 }
 
 /** Add every request the Network tab has that the list doesn't. */
@@ -522,15 +603,20 @@ const STATUS_LABELS = { sending: 'saving…', saved: 'saved', failed: 'failed' }
 function addEntry(entry) {
   // Keep newest first. Live requests go straight to the top; backfilled
   // ones may belong further down.
+  // Build the row first: if that throws, the list stays consistent.
+  const els = createRow(entry);
   let index = 0;
   while (index < state.entries.length && state.entries[index].time > entry.time) index++;
-  const before = state.entries[index];
   state.entries.splice(index, 0, entry);
-
-  const els = createRow(entry);
   rowEls.set(entry.id, els);
-  const tbody = $('captureRows');
-  tbody.insertBefore(els.row, before ? rowEls.get(before.id).row : null);
+
+  // Insert before the next older entry that has a row.
+  let beforeRow = null;
+  for (let i = index + 1; i < state.entries.length && !beforeRow; i++) {
+    const other = rowEls.get(state.entries[i].id);
+    if (other) beforeRow = other.row;
+  }
+  $('captureRows').insertBefore(els.row, beforeRow);
 
   if (entry.isStatic) state.staticCount++;
   // Static files have their own small budget so they can't push API calls out.
@@ -819,7 +905,14 @@ function initList() {
     button.textContent = `Sync from Network tab (+${added})`;
     setTimeout(() => (button.textContent = 'Sync from Network tab'), 2500);
   });
-  $('copyDiagnostics').addEventListener('click', () => showReport(buildReport()));
+  $('copyDiagnostics').addEventListener('click', async () => {
+    try {
+      showReport(await buildReport());
+    } catch (err) {
+      recordError('buildReport', err);
+      showReport(`The report failed: ${err && err.stack}\n\nPanel errors:\n${JSON.stringify(state.errors, null, 2)}`);
+    }
+  });
   $('closeReport').addEventListener('click', () => $('reportDialog').close());
   $('copyReport').addEventListener('click', copyReport);
 
@@ -935,13 +1028,51 @@ function buildDiagnostics(har, isStatic) {
   };
 }
 
-function buildReport() {
+/**
+ * What Chrome's own Network log (getHAR) has, next to what the panel has.
+ * If a request is in Chrome's log but not in the panel, the panel lost it;
+ * if it is not in Chrome's log either, Chrome does not give it to extensions.
+ */
+async function chromeLogSummary() {
+  let log;
+  try {
+    log = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('getHAR() timed out')), 5000);
+      chrome.devtools.network.getHAR((l) => { clearTimeout(timer); resolve(l); });
+    });
+  } catch (err) {
+    return { error: err.message };
+  }
+  // Non-static requests, plus preflights (they show which calls were cross-origin).
+  const entries = ((log && log.entries) || []).filter((e) => !isStaticRequest(e) || e._resourceType === 'preflight');
+  return {
+    nonStaticEntries: entries.length,
+    postPutPatchDelete: entries.filter((e) => BODY_METHODS.includes(e.request.method)).length,
+    preflights: entries.filter((e) => e._resourceType === 'preflight').length,
+    // Newest 60 of them, and whether the panel has each one.
+    newest: entries.slice(-60).reverse().map((e) => ({
+      method: e.request.method,
+      chromeType: e._resourceType,
+      status: e.response && e.response.status,
+      url: redactUrl(e.request.url),
+      hasPostData: Boolean(e.request.postData),
+      inPanel: state.seen.has(requestKey(e)),
+    })),
+  };
+}
+
+async function buildReport() {
   const nonStatic = state.entries.filter((e) => !e.isStatic);
   const bodyMethods = nonStatic.filter((e) => BODY_METHODS.includes(e.method));
   const withRequestJson = bodyMethods.filter((e) => e.request.has).length;
   const report = {
     extensionVersion: chrome.runtime?.getManifest?.().version,
     userAgent: navigator.userAgent,
+    inspectedTabId: chrome.devtools?.inspectedWindow?.tabId,
+    panelErrors: state.errors,
+    chromeNetworkLog: await chromeLogSummary(),
+    // The newest 150 requests Chrome delivered to the panel, and what happened to each.
+    receivedEvents: state.events.filter((ev) => ev.chromeType !== 'script' && ev.chromeType !== 'image' && ev.chromeType !== 'stylesheet' && ev.chromeType !== 'font').slice(-150).reverse(),
     settings: {
       record: state.settings.captureEnabled,
       saveMode: state.settings.saveMode,
@@ -965,7 +1096,7 @@ function buildReport() {
     // Newest 40 requests that are not static files.
     requests: nonStatic.slice(0, 40).map((e) => ({
       ...e.diag,
-      request: { ...e.diag.request, result: e.request.has ? (e.request.converted || 'json') : e.request.note },
+      request: { ...(e.diag.request || {}), result: e.request.has ? e.request.converted || 'json' : e.request.note },
       visible: isVisible(e),
       flagged: e.flagged,
       saves: e.saves,
