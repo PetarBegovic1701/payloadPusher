@@ -1,7 +1,26 @@
 'use strict';
 
 const fs = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
+
+/**
+ * Work out which folder a capture goes to.
+ *   ""/undefined     -> the server's default output dir
+ *   "~/fixtures"     -> home-relative
+ *   "/abs/path"      -> used as is
+ *   "users/v2"       -> relative to the server's default output dir
+ */
+function resolveOutputDir(defaultDir, requested) {
+  if (requested === undefined || requested === null || String(requested).trim() === '') {
+    return defaultDir;
+  }
+  let dir = String(requested).trim();
+  if (dir === '~' || dir.startsWith('~/') || dir.startsWith('~\\')) {
+    dir = path.join(os.homedir(), dir.slice(1));
+  }
+  return path.resolve(defaultDir, dir);
+}
 
 /**
  * Make a schema name safe to use as a file/folder name.
@@ -100,4 +119,4 @@ async function writePayload({ outputDir, schemaName, payload, timestamp, flat })
   return file;
 }
 
-module.exports = { sanitizeSchemaName, timestampToFileName, savePayload };
+module.exports = { sanitizeSchemaName, timestampToFileName, resolveOutputDir, savePayload, exists };

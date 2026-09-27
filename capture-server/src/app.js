@@ -2,7 +2,16 @@
 
 const path = require('node:path');
 const express = require('express');
-const { sanitizeSchemaName, savePayload } = require('./storage');
+const { sanitizeSchemaName, resolveOutputDir, savePayload, exists } = require('./storage');
+
+// Browsers attach an Origin header to cross-origin requests. Only the
+// extension (chrome-extension://…, or extension://… in Edge) and non-browser tools like curl (no Origin)
+// may use the server. Without this, any web page you visit could POST here
+// and, because the output folder is chosen per request, write JSON files
+// anywhere your user account can write.
+function isAllowedOrigin(origin) {
+  return !origin || origin.startsWith('chrome-extension://') || origin.startsWith('extension://');
+}
 
 /**
  * Build the Express app. Kept separate from server.js so it can be tested
@@ -14,13 +23,18 @@ function createApp(config) {
   const log = config.log ?? ((msg) => console.log(msg));
   const app = express();
 
-  // The DevTools panel runs on a chrome-extension:// origin. With the
-  // extension's host_permissions CORS isn't strictly required, but sending
-  // permissive headers keeps things working from other local tools too.
   app.use((req, res, next) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    const origin = req.get('Origin');
+    if (!isAllowedOrigin(origin)) {
+      log(`[capture] Rejected ${req.method} ${req.path} from origin ${origin}`);
+      return res.status(403).json({ error: `Origin not allowed: ${origin}` });
+    }
+    if (origin) {
+      res.set('Access-Control-Allow-Origin', origin);
+      res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.set('Access-Control-Allow-Headers', 'Content-Type');
+      res.set('Vary', 'Origin');
+    }
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
@@ -31,13 +45,26 @@ function createApp(config) {
     res.json({ status: 'ok' });
   });
 
+  // Lets the panel show where a folder setting will actually write to.
+  // GET /config?outputDir=<dir>
+  app.get('/config', async (req, res) => {
+    const requested = typeof req.query.outputDir === 'string' ? req.query.outputDir : '';
+    const resolved = resolveOutputDir(config.outputDir, requested);
+    res.json({
+      defaultOutputDir: config.outputDir,
+      outputDir: resolved,
+      exists: await exists(resolved),
+      flat: config.flat,
+    });
+  });
+
   app.post('/capture', async (req, res) => {
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       return res.status(400).json({ error: 'Request body must be a JSON object (is Content-Type application/json?)' });
     }
 
-    const { schemaName, url, method, payload, timestamp } = body;
+    const { schemaName, url, method, payload, timestamp, outputDir } = body;
 
     if (typeof schemaName !== 'string' || schemaName.trim() === '') {
       return res.status(400).json({ error: 'Missing or empty "schemaName" (string)' });
@@ -49,11 +76,14 @@ function createApp(config) {
     if (payload === undefined) {
       return res.status(400).json({ error: 'Missing "payload"' });
     }
+    if (outputDir !== undefined && outputDir !== null && typeof outputDir !== 'string') {
+      return res.status(400).json({ error: '"outputDir" must be a string' });
+    }
 
     let saved;
     try {
       saved = await savePayload({
-        outputDir: config.outputDir,
+        outputDir: resolveOutputDir(config.outputDir, outputDir),
         schemaName: safeName,
         payload,
         timestamp,

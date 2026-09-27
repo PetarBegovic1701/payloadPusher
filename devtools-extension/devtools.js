@@ -5,7 +5,7 @@
 // right away, buffer finished requests, and hand them to the panel as soon as
 // it is shown for the first time. After that, requests are forwarded live.
 
-const MAX_BUFFERED = 500;
+const MAX_BUFFERED = 1000;
 const buffered = [];
 let panelWindow = null;
 
