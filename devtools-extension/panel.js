@@ -1,17 +1,21 @@
 // Payload Capture panel.
 //
-// Every finished request in the inspected tab is listed. Requests with a JSON
-// body can be flagged (checkbox) and saved to the capture server, either one
-// by one or with "Save flagged". Optional matching rules can pre-flag or
-// auto-save requests as they arrive.
+// Every finished request in the inspected tab is listed. For each request the
+// panel reads the request payload and (for non-static requests) the response
+// body. Rows with something to save can be flagged (checkbox) and saved to the
+// capture server, one by one or with "Save flagged". The "Save" menu picks
+// what is saved: the request payload, the response body, or both. Optional
+// matching rules can pre-flag or auto-save requests as they arrive.
 //
 // Sections:
 //   1. Settings & storage
 //   2. Filter + naming logic   <- the bits you'll most likely want to tweak
-//   3. Capture pipeline (ingest -> parse -> name -> rules -> save)
-//   4. Request list UI (view filters, flagging, saving)
-//   5. Output folder
-//   6. Settings + mappings UI
+//   3. Body parsing (request payload, response body)
+//   4. Capture pipeline (ingest -> parse -> name -> rules -> save)
+//   5. Request list UI (view filters, flagging, saving)
+//   6. Diagnostics
+//   7. Output folder
+//   8. Settings + mappings UI
 
 /* global DEFAULT_MAPPINGS, isStaticRequest, requestKey */
 
@@ -24,13 +28,21 @@ const MAX_ROWS = 5000; // all rows
 const MAX_STATIC_ROWS = 300; // of which scripts, images, … (oldest are dropped first)
 const MAX_RECENT_DIRS = 8;
 const MAX_RAW_BODY = 100 * 1024; // keep at most 100 KB of non-JSON bodies for viewing
+const MAX_RESPONSE_BYTES = 20 * 1024 * 1024; // don't load response bodies bigger than this
+const RESPONSE_TIMEOUT_MS = 5000;
+// A response body is saved as "<schema><suffix>.json", e.g. createUser_response.json.
+const RESPONSE_SUFFIX = '_response';
+
+const KINDS = ['request', 'response'];
+const KIND_LABELS = { request: 'request', response: 'response' };
 
 const DEFAULT_SETTINGS = {
   captureEnabled: true,
   serverUrl: 'http://127.0.0.1:4545',
   outputDir: '', // '' = server's default (--output-dir)
   recentOutputDirs: [],
-  // Matching rules: what to do with a JSON request that matches them.
+  saveMode: 'request', // 'request' | 'response' | 'both'
+  // Matching rules: what to do with a request that matches them.
   ruleAction: 'flag', // 'off' | 'flag' | 'save'
   ruleMethods: ['POST', 'PUT', 'PATCH'],
   ruleUrlFilter: '',
@@ -191,7 +203,7 @@ function resolveSchemaName(url, method) {
 function isVisible(entry) {
   const v = state.settings.view;
   if (v.hideStatic && entry.isStatic) return false;
-  if (v.jsonOnly && !entry.hasJson) return false;
+  if (v.jsonOnly && savableKinds(entry).length === 0) return false;
   if (v.method && entry.method !== v.method) return false;
   const search = v.search.trim();
   if (search && !safeMatch(search, entry.url) && !safeMatch(search, entry.schemaName)) return false;
@@ -199,7 +211,143 @@ function isVisible(entry) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Capture pipeline
+// 3. Body parsing
+// ---------------------------------------------------------------------------
+//
+// Each body becomes { has, json, note, raw, converted }:
+//   has        true when there is JSON to save
+//   json       the parsed value
+//   note       why there is nothing to save (shown in the row)
+//   raw        the original text when it is not JSON (for the { } viewer)
+//   converted  'form' when a form body was turned into a JSON object
+
+const BODY_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
+
+function noBody(note) {
+  return { has: false, json: undefined, note, raw: '', converted: '' };
+}
+
+function clip(text) {
+  return text.length > MAX_RAW_BODY ? text.slice(0, MAX_RAW_BODY) + '\n… (truncated)' : text;
+}
+
+/**
+ * Parse JSON leniently: ignores a byte-order mark and the ")]}'" anti-JSON-
+ * hijacking prefix some backends put in front of responses.
+ */
+function parseJson(text) {
+  const cleaned = text.replace(/^﻿/, '').replace(/^\)\]\}',?\s*/, '');
+  return JSON.parse(cleaned);
+}
+
+/** Form fields -> { name: value }, repeated names -> arrays, files -> a stub. */
+function paramsToObject(params) {
+  const out = {};
+  for (const p of params) {
+    const value = p.fileName !== undefined ? { fileName: p.fileName, contentType: p.contentType || '' } : p.value ?? '';
+    if (Object.prototype.hasOwnProperty.call(out, p.name)) {
+      out[p.name] = [].concat(out[p.name], value);
+    } else {
+      out[p.name] = value;
+    }
+  }
+  return out;
+}
+
+/** The request payload, from the HAR entry's request.postData. */
+function parseRequestBody(har) {
+  const method = (har.request.method || '').toUpperCase();
+  const postData = har.request.postData;
+
+  if (!postData) {
+    if (!BODY_METHODS.includes(method)) return noBody('');
+    if (har.request.bodySize > 0) {
+      return noBody(`Chrome did not record the body (${har.request.bodySize} bytes were sent)`);
+    }
+    return noBody('No request body. Empty, or sent as a stream, which Chrome does not record');
+  }
+
+  const mime = (postData.mimeType || '').toLowerCase();
+  const text = postData.text;
+  const isForm = mime.includes('application/x-www-form-urlencoded') || mime.includes('multipart/form-data');
+
+  if (typeof text === 'string' && text.trim() !== '' && !isForm) {
+    try {
+      return { has: true, json: parseJson(text), note: '', raw: '', converted: '' };
+    } catch {
+      return { ...noBody(`Body is not JSON (${postData.mimeType || 'unknown type'})`), raw: clip(text) };
+    }
+  }
+
+  if (isForm) {
+    let fields = null;
+    if (Array.isArray(postData.params) && postData.params.length) {
+      fields = paramsToObject(postData.params);
+    } else if (typeof text === 'string' && mime.includes('urlencoded')) {
+      fields = paramsToObject([...new URLSearchParams(text)].map(([name, value]) => ({ name, value })));
+    }
+    if (fields) return { has: true, json: fields, note: '', raw: clip(text || ''), converted: 'form' };
+    return { ...noBody(`Form body that could not be read (${postData.mimeType})`), raw: clip(text || '') };
+  }
+
+  return noBody('Empty request body');
+}
+
+function getContent(har) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ content: null, encoding: '', timedOut: true }), RESPONSE_TIMEOUT_MS);
+    try {
+      har.getContent((content, encoding) => {
+        clearTimeout(timer);
+        resolve({ content, encoding });
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      resolve({ content: null, encoding: '', error: err.message });
+    }
+  });
+}
+
+/** The response body. Uses content.text when the HAR has it, else getContent(). */
+async function loadResponseBody(har) {
+  const res = har.response || {};
+  const info = res.content || {};
+  const mime = info.mimeType || 'unknown type';
+  if (!res.status) return noBody('No response (request failed or was cancelled)');
+  if (res.status === 204 || res.status === 304) return noBody(`No response body (${res.status})`);
+  if (info.size > MAX_RESPONSE_BYTES) return noBody(`Response too large to load (${Math.round(info.size / 1048576)} MB)`);
+
+  let content = info.text;
+  let encoding = info.encoding || '';
+  if (content === undefined) {
+    if (typeof har.getContent !== 'function') return noBody('Response body not available from Chrome');
+    const result = await getContent(har);
+    if (result.timedOut) return noBody('Chrome did not return the response body in time');
+    content = result.content;
+    encoding = result.encoding;
+  }
+  if (content === null || content === undefined) {
+    return noBody('Response body no longer available in DevTools (reload the page with DevTools open)');
+  }
+
+  if (encoding === 'base64') {
+    if (!/json|text|javascript/i.test(mime)) return noBody(`Binary response (${mime})`);
+    try {
+      content = new TextDecoder().decode(Uint8Array.from(atob(content), (c) => c.charCodeAt(0)));
+    } catch {
+      return noBody(`Binary response (${mime})`);
+    }
+  }
+  if (content.trim() === '') return noBody('Empty response body');
+  try {
+    return { has: true, json: parseJson(content), note: '', raw: '', converted: '' };
+  } catch {
+    return { ...noBody(`Response is not JSON (${mime})`), raw: clip(content) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Capture pipeline
 // ---------------------------------------------------------------------------
 
 let nextId = 1;
@@ -226,51 +374,48 @@ async function ingest(har, options = {}) {
   state.seen.add(key);
   const method = (har.request.method || '').toUpperCase();
   const timestamp = har.startedDateTime || new Date().toISOString();
+  const isStatic = isStaticRequest(har);
 
   const entry = {
     id: nextId++,
     timestamp,
     time: Date.parse(timestamp) || Date.now(),
-    isStatic: isStaticRequest(har),
+    isStatic,
     method,
     url,
     resourceType: har._resourceType || '',
     responseStatus: har.response ? har.response.status : 0,
-    hasJson: false,
-    payload: undefined,
-    rawBody: '',
+    request: parseRequestBody(har),
+    response: isStatic ? noBody('') : { ...noBody('Loading response…'), loading: true },
     schemaName: '',
     schemaSource: '',
     flagged: false,
-    status: 'nobody', // 'nobody' | 'new' | 'sending' | 'saved' | 'failed'
-    detail: '',
+    saves: { request: { status: '', detail: '' }, response: { status: '', detail: '' } },
+    diag: buildDiagnostics(har, isStatic),
   };
 
-  const postData = har.request.postData;
-  const text = postData && postData.text;
-  if (!text) {
-    entry.detail = 'No request body';
-  } else {
-    try {
-      entry.payload = JSON.parse(text);
-      entry.hasJson = true;
-      entry.status = 'new';
-    } catch {
-      entry.rawBody = text.length > MAX_RAW_BODY ? text.slice(0, MAX_RAW_BODY) + '\n… (truncated)' : text;
-      entry.detail = `Body is not JSON (${(postData && postData.mimeType) || 'unknown type'})`;
-    }
-  }
+  entry.diag.request.result = entry.request.has ? entry.request.converted || 'json' : entry.request.note;
 
   const resolved = resolveSchemaName(url, method);
   entry.schemaName = resolved.name;
   entry.schemaSource = resolved.source;
 
-  const action = state.settings.ruleAction === 'save' && options.backfill ? 'flag' : state.settings.ruleAction;
-  const ruleHit = entry.hasJson && action !== 'off' && matchesRules(method, url, entry.responseStatus);
-  if (ruleHit && action === 'flag') entry.flagged = true;
-
   addEntry(entry);
 
+  if (!isStatic) {
+    entry.response = await loadResponseBody(har);
+    entry.diag.responseResult = entry.response.has ? 'json' : entry.response.note;
+    updateRow(entry);
+    if (!state.batching) renderCounters();
+  }
+
+  const action = state.settings.ruleAction === 'save' && options.backfill ? 'flag' : state.settings.ruleAction;
+  const ruleHit = action !== 'off' && savableKinds(entry).length > 0 && matchesRules(method, url, entry.responseStatus);
+  if (ruleHit && action === 'flag') {
+    entry.flagged = true;
+    updateRow(entry);
+    if (!state.batching) renderCounters();
+  }
   if (ruleHit && action === 'save') save(entry);
   return true;
 }
@@ -292,16 +437,39 @@ async function backfill() {
   return added;
 }
 
-async function save(entry) {
-  if (!entry.hasJson || entry.status === 'sending') return;
-  const schemaName = sanitizeSchemaName(entry.schemaName);
-  if (!schemaName) {
-    setStatus(entry, 'failed', 'Schema name is empty');
-    return;
-  }
+/** Which bodies of this entry the current "Save" setting would save. */
+function savableKinds(entry) {
+  const mode = state.settings.saveMode;
+  const wanted = mode === 'both' ? KINDS : [mode];
+  return wanted.filter((kind) => entry[kind].has);
+}
 
+function isSending(entry) {
+  return KINDS.some((kind) => entry.saves[kind].status === 'sending');
+}
+
+/** Save what the "Save" setting asks for. Unflags the row when all of it saved. */
+async function save(entry) {
+  const kinds = savableKinds(entry);
+  if (kinds.length === 0 || isSending(entry)) return;
+  let allOk = true;
+  for (const kind of kinds) {
+    if (!(await saveKind(entry, kind))) allOk = false;
+  }
+  if (allOk) entry.flagged = false;
+  updateRow(entry);
+  renderCounters();
+}
+
+async function saveKind(entry, kind) {
+  const base = sanitizeSchemaName(entry.schemaName);
+  if (!base) {
+    setSaveStatus(entry, kind, 'failed', 'Schema name is empty');
+    return false;
+  }
+  const schemaName = kind === 'response' ? base + RESPONSE_SUFFIX : base;
   const outputDir = state.settings.outputDir.trim();
-  setStatus(entry, 'sending', '');
+  setSaveStatus(entry, kind, 'sending', '');
   const endpoint = serverBase() + '/capture';
   try {
     const res = await fetch(endpoint, {
@@ -311,24 +479,24 @@ async function save(entry) {
         schemaName,
         url: entry.url,
         method: entry.method,
-        payload: entry.payload,
+        payload: entry[kind].json,
         timestamp: entry.timestamp,
         outputDir: outputDir || undefined,
       }),
     });
     const body = await res.json().catch(() => ({}));
     if (res.ok) {
-      entry.flagged = false;
-      setStatus(entry, 'saved', body.saved ? `→ ${body.saved}` : '');
+      setSaveStatus(entry, kind, 'saved', body.saved ? `→ ${body.saved}` : '');
       setServerStatus(true);
       rememberOutputDir(outputDir);
-    } else {
-      setStatus(entry, 'failed', body.error || `HTTP ${res.status}`);
+      return true;
     }
+    setSaveStatus(entry, kind, 'failed', body.error || `HTTP ${res.status}`);
   } catch (err) {
-    setStatus(entry, 'failed', `Cannot reach ${endpoint}. Is the capture server running? (${err.message})`);
+    setSaveStatus(entry, kind, 'failed', `Cannot reach ${endpoint}. Is the capture server running? (${err.message})`);
     setServerStatus(false);
   }
+  return false;
 }
 
 /** Oldest first and one at a time, so history files keep the request order. */
@@ -343,19 +511,13 @@ async function saveFlagged() {
 window.payloadCapture = { ingest };
 
 // ---------------------------------------------------------------------------
-// 4. Request list UI
+// 5. Request list UI
 // ---------------------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
 const rowEls = new Map(); // entry.id -> { row, detailRow }
 
-const STATUS_LABELS = {
-  nobody: '',
-  new: 'not saved',
-  sending: 'saving…',
-  saved: 'saved',
-  failed: 'failed',
-};
+const STATUS_LABELS = { sending: 'saving…', saved: 'saved', failed: 'failed' };
 
 function addEntry(entry) {
   // Keep newest first. Live requests go straight to the top; backfilled
@@ -401,8 +563,6 @@ function createRow(entry) {
   const row = $('captureRowTemplate').content.firstElementChild.cloneNode(true);
   const els = { row, detailRow: null };
 
-  row.classList.toggle('no-json', !entry.hasJson);
-
   const flag = row.querySelector('.flag');
   flag.addEventListener('change', () => {
     entry.flagged = flag.checked;
@@ -441,46 +601,84 @@ function createRow(entry) {
   return els;
 }
 
+/** Lines for the "Saved?" cell: one per body the Save setting covers. */
+function statusLines(entry) {
+  const mode = state.settings.saveMode;
+  const kinds = mode === 'both' ? KINDS : [mode];
+  const lines = [];
+  for (const kind of kinds) {
+    const save = entry.saves[kind];
+    const body = entry[kind];
+    const prefix = kinds.length > 1 ? `${KIND_LABELS[kind]}: ` : '';
+    if (save.status) {
+      lines.push({ cls: `status-${save.status}`, text: prefix + STATUS_LABELS[save.status], detail: save.detail });
+    } else if (body.has) {
+      const note = body.converted === 'form' ? 'form fields, saved as JSON' : '';
+      lines.push({ cls: 'status-new', text: prefix + 'not saved', detail: note });
+    } else if (body.note) {
+      lines.push({ cls: body.loading ? 'status-sending' : 'status-none', text: '', detail: prefix + body.note });
+    }
+  }
+  return lines;
+}
+
 function updateRow(entry, els = rowEls.get(entry.id)) {
   if (!els) return;
   const { row } = els;
-  row.dataset.status = entry.status;
+  const savable = savableKinds(entry).length > 0;
+  const sending = isSending(entry);
+  row.classList.toggle('no-json', !savable);
   row.hidden = !isVisible(entry);
-  if (els.detailRow) els.detailRow.hidden = row.hidden;
+  if (els.detailRow) {
+    els.detailRow.hidden = row.hidden;
+    renderDetail(entry, els.detailRow);
+  }
 
   const flag = row.querySelector('.flag');
   flag.checked = entry.flagged;
-  flag.disabled = !entry.hasJson || entry.status === 'sending';
-  flag.title = entry.hasJson ? 'Flag to save with "Save flagged"' : 'Only requests with a JSON body can be saved';
+  flag.disabled = !savable || sending;
+  flag.title = savable ? 'Flag to save with "Save flagged"' : 'Nothing to save for the current "Save" setting';
 
-  const status = row.querySelector('.status');
-  status.textContent = STATUS_LABELS[entry.status];
-  status.className = `status status-${entry.status}`;
-  const detail = row.querySelector('.status-detail');
-  detail.textContent = entry.detail;
-  detail.title = entry.detail;
+  const cell = row.querySelector('.col-status');
+  cell.textContent = '';
+  for (const line of statusLines(entry)) {
+    const div = document.createElement('div');
+    if (line.text) {
+      const status = document.createElement('span');
+      status.className = `status ${line.cls}`;
+      status.textContent = line.text;
+      div.appendChild(status);
+    }
+    if (line.detail) {
+      const detail = document.createElement('div');
+      detail.className = 'status-detail';
+      detail.textContent = line.detail;
+      detail.title = line.detail;
+      div.appendChild(detail);
+    }
+    cell.appendChild(div);
+  }
 
   const preview = sanitizeSchemaName(entry.schemaName);
   row.querySelector('.schema-source').textContent =
     entry.schemaSource + (preview !== entry.schemaName ? ` · saves as ${preview || '(invalid)'}` : '');
 
   const sendBtn = row.querySelector('.send-btn');
-  sendBtn.disabled = !entry.hasJson || entry.status === 'sending';
-  sendBtn.textContent = entry.status === 'saved' || entry.status === 'failed' ? 'Save again' : 'Save';
-  row.querySelector('.view-btn').disabled = !entry.hasJson && !entry.rawBody;
+  sendBtn.disabled = !savable || sending;
+  const anyDone = KINDS.some((k) => ['saved', 'failed'].includes(entry.saves[k].status));
+  sendBtn.textContent = anyDone ? 'Save again' : 'Save';
 }
 
-function setStatus(entry, status, detail) {
-  entry.status = status;
-  entry.detail = detail;
+function setSaveStatus(entry, kind, status, detail) {
+  entry.saves[kind] = { status, detail };
   updateRow(entry);
-  renderCounters();
 }
 
 /** After a mapping change, rename rows that haven't been saved or hand-edited. */
 function reresolveUnsaved() {
   for (const entry of state.entries) {
-    if (entry.schemaSource === 'edited' || entry.status === 'saved' || entry.status === 'sending') continue;
+    if (entry.schemaSource === 'edited') continue;
+    if (KINDS.some((k) => ['saved', 'sending'].includes(entry.saves[k].status))) continue;
     const resolved = resolveSchemaName(entry.url, entry.method);
     entry.schemaName = resolved.name;
     entry.schemaSource = resolved.source;
@@ -503,14 +701,48 @@ function toggleDetail(entry, els) {
   }
   const tr = document.createElement('tr');
   tr.className = 'detail-row';
-  const td = document.createElement('td');
-  td.colSpan = 8;
-  const pre = document.createElement('pre');
-  pre.textContent = entry.hasJson ? JSON.stringify(entry.payload, null, 2) : entry.rawBody;
-  td.appendChild(pre);
-  tr.appendChild(td);
   els.row.after(tr);
   els.detailRow = tr;
+  renderDetail(entry, tr);
+}
+
+/** The { } viewer: request payload, response body, and diagnostics. */
+function renderDetail(entry, tr) {
+  tr.textContent = '';
+  const td = document.createElement('td');
+  td.colSpan = 8;
+  const grid = document.createElement('div');
+  grid.className = 'detail-grid';
+
+  for (const kind of KINDS) {
+    const body = entry[kind];
+    const section = document.createElement('section');
+    const h = document.createElement('h4');
+    h.textContent = kind === 'request' ? 'Request payload' : 'Response body';
+    if (body.converted === 'form') h.textContent += ' (form fields as JSON)';
+    const pre = document.createElement('pre');
+    if (body.has) pre.textContent = JSON.stringify(body.json, null, 2);
+    else if (body.raw) pre.textContent = `(${body.note})\n\n${body.raw}`;
+    else pre.textContent = `(${body.note || 'none'})`;
+    section.append(h, pre);
+    grid.appendChild(section);
+  }
+
+  const diag = document.createElement('section');
+  diag.className = 'diag';
+  const h = document.createElement('h4');
+  h.textContent = 'Diagnostics (no body contents)';
+  const copy = document.createElement('button');
+  copy.textContent = 'Copy';
+  copy.addEventListener('click', () => showReport(JSON.stringify(entry.diag, null, 2)));
+  h.append(' ', copy);
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(entry.diag, null, 2);
+  diag.append(h, pre);
+  grid.appendChild(diag);
+
+  td.appendChild(grid);
+  tr.appendChild(td);
 }
 
 function renderCounters() {
@@ -524,9 +756,9 @@ function renderCounters() {
     const visible = isVisible(e);
     if (visible) shown++;
     if (e.flagged) flagged++;
-    if (e.status === 'saved') saved++;
-    if (e.status === 'failed') failed++;
-    if (visible && e.hasJson && e.status !== 'sending') {
+    if (KINDS.some((k) => e.saves[k].status === 'saved')) saved++;
+    if (KINDS.some((k) => e.saves[k].status === 'failed')) failed++;
+    if (visible && savableKinds(e).length > 0 && !isSending(e)) {
       visibleSavable++;
       if (e.flagged) visibleFlagged++;
     }
@@ -567,7 +799,7 @@ function initList() {
   $('flagAll').addEventListener('change', () => {
     const value = $('flagAll').checked;
     for (const e of state.entries) {
-      if (e.hasJson && e.status !== 'sending' && isVisible(e)) e.flagged = value;
+      if (savableKinds(e).length > 0 && !isSending(e) && isVisible(e)) e.flagged = value;
     }
     applyView();
   });
@@ -586,6 +818,19 @@ function initList() {
     button.disabled = false;
     button.textContent = `Sync from Network tab (+${added})`;
     setTimeout(() => (button.textContent = 'Sync from Network tab'), 2500);
+  });
+  $('copyDiagnostics').addEventListener('click', () => showReport(buildReport()));
+  $('closeReport').addEventListener('click', () => $('reportDialog').close());
+  $('copyReport').addEventListener('click', copyReport);
+
+  const saveMode = $('saveMode');
+  saveMode.value = state.settings.saveMode;
+  saveMode.addEventListener('change', () => {
+    state.settings.saveMode = saveMode.value;
+    saveSettings();
+    // Flags only make sense for rows that still have something to save.
+    for (const e of state.entries) if (savableKinds(e).length === 0) e.flagged = false;
+    applyView();
   });
 
   // View filters.
@@ -625,7 +870,133 @@ function initList() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Output folder + server status
+// 6. Diagnostics
+// ---------------------------------------------------------------------------
+//
+// Facts about what Chrome handed the extension, without any body contents,
+// cookies or auth headers, so they can be pasted into a bug report.
+
+function header(headers, name) {
+  const h = (headers || []).find((x) => x.name.toLowerCase() === name);
+  return h ? h.value : undefined;
+}
+
+/** URL without query values (keeps the keys), so tokens in URLs are not shared. */
+function redactUrl(url) {
+  try {
+    const u = new URL(url);
+    const keys = [...u.searchParams.keys()];
+    return u.origin + u.pathname + (keys.length ? '?' + keys.map((k) => `${k}=…`).join('&') : '');
+  } catch {
+    return url.split('?')[0];
+  }
+}
+
+/** First non-space character of a body, to tell JSON / form / other apart. */
+function firstChar(text) {
+  const m = typeof text === 'string' ? text.match(/\S/) : null;
+  return m ? m[0] : '';
+}
+
+function buildDiagnostics(har, isStatic) {
+  const req = har.request || {};
+  const res = har.response || {};
+  const pd = req.postData;
+  return {
+    method: req.method,
+    url: redactUrl(req.url || ''),
+    chromeType: har._resourceType || '(none)',
+    isStatic,
+    initiator: har._initiator ? har._initiator.type : undefined,
+    viaServiceWorker: res._fetchedViaServiceWorker,
+    request: {
+      contentTypeHeader: header(req.headers, 'content-type'),
+      contentEncodingHeader: header(req.headers, 'content-encoding'),
+      bodySize: req.bodySize,
+      postData: pd
+        ? {
+            mimeType: pd.mimeType,
+            textLength: typeof pd.text === 'string' ? pd.text.length : '(missing)',
+            firstChar: firstChar(pd.text),
+            paramsCount: Array.isArray(pd.params) ? pd.params.length : undefined,
+          }
+        : '(missing)',
+      result: undefined, // filled in below
+    },
+    response: {
+      status: res.status,
+      mimeType: res.content ? res.content.mimeType : undefined,
+      size: res.content ? res.content.size : undefined,
+      contentTextInHar: res.content ? res.content.text !== undefined : false,
+      hasGetContent: typeof har.getContent === 'function',
+      error: res._error || undefined,
+    },
+    responseResult: isStatic ? '(not loaded for static files)' : 'loading',
+  };
+}
+
+function buildReport() {
+  const nonStatic = state.entries.filter((e) => !e.isStatic);
+  const bodyMethods = nonStatic.filter((e) => BODY_METHODS.includes(e.method));
+  const withRequestJson = bodyMethods.filter((e) => e.request.has).length;
+  const report = {
+    extensionVersion: chrome.runtime?.getManifest?.().version,
+    userAgent: navigator.userAgent,
+    settings: {
+      record: state.settings.captureEnabled,
+      saveMode: state.settings.saveMode,
+      ruleAction: state.settings.ruleAction,
+      ruleMethods: state.settings.ruleMethods,
+      ruleOkOnly: state.settings.ruleOkOnly,
+      ruleUrlFilterSet: Boolean(state.settings.ruleUrlFilter.trim()),
+      view: { ...state.settings.view, search: state.settings.view.search ? '(set)' : '' },
+      mappings: state.mappings.length,
+    },
+    counts: {
+      listed: state.entries.length,
+      static: state.staticCount,
+      droppedByLimit: state.dropped,
+      nonStatic: nonStatic.length,
+      postPutPatchDelete: bodyMethods.length,
+      ofWhichRequestSavable: withRequestJson,
+      ofWhichResponseSavable: bodyMethods.filter((e) => e.response.has).length,
+      visible: state.entries.filter(isVisible).length,
+    },
+    // Newest 40 requests that are not static files.
+    requests: nonStatic.slice(0, 40).map((e) => ({
+      ...e.diag,
+      request: { ...e.diag.request, result: e.request.has ? (e.request.converted || 'json') : e.request.note },
+      visible: isVisible(e),
+      flagged: e.flagged,
+      saves: e.saves,
+    })),
+  };
+  return JSON.stringify(report, null, 2);
+}
+
+function showReport(text) {
+  $('reportText').value = text;
+  $('reportStatus').textContent = 'Check the text, then paste it into your message.';
+  $('reportDialog').showModal();
+  $('reportText').select();
+}
+
+async function copyReport() {
+  const textarea = $('reportText');
+  textarea.select();
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(textarea.value);
+    ok = true;
+  } catch {
+    // DevTools panels may not get clipboard permission; fall back.
+    ok = document.execCommand('copy');
+  }
+  $('reportStatus').textContent = ok ? 'Copied.' : 'Copy failed: select the text and press Ctrl+C / Cmd+C.';
+}
+
+// ---------------------------------------------------------------------------
+// 7. Output folder + server status
 // ---------------------------------------------------------------------------
 
 function serverBase() {
@@ -708,7 +1079,7 @@ function initOutputDir() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Settings + mappings UI
+// 8. Settings + mappings UI
 // ---------------------------------------------------------------------------
 
 function initToolbar() {

@@ -168,7 +168,8 @@ th { color: var(--muted); font-weight: 600; background: var(--bg); }
 .schema-source { display: block; color: var(--muted); font-size: 11px; }
 
 .status { font-weight: 700; text-transform: uppercase; font-size: 11px; }
-.status-sent { color: var(--ok); }
+.status-saved { color: var(--ok); }
+.col-status > div + div { margin-top: 3px; }
 .status-failed { color: var(--err); }
 .status-new { color: var(--muted); }
 .status-sending { color: var(--accent); }
@@ -189,6 +190,26 @@ th { color: var(--muted); font-weight: 600; background: var(--bg); }
 }
 
 .detail-row td { background: var(--bg-alt); }
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 10px;
+}
+.detail-grid section { min-width: 0; }
+.detail-grid pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.detail-grid h4 { margin: 2px 0 4px; font-size: 11px; color: var(--muted); }
+.detail-grid h4 button { font-size: 11px; padding: 0 6px; margin-left: 6px; }
+
+dialog {
+  width: min(900px, 90vw);
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+dialog::backdrop { background: rgb(0 0 0 / 0.45); }
+dialog h3 { margin: 0 0 6px; }
+dialog textarea { width: 100%; font-size: 11px; }
 .detail-row pre {
   margin: 0;
   max-height: 300px;

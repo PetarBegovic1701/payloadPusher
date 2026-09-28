@@ -14,7 +14,16 @@
           <span class="switch-label">Record</span>
         </label>
 
-        <label class="inline" title="What to do with JSON requests that match the rules in Settings → Matching rules">
+        <label class="inline" title="What gets written to disk. A response body is saved as <schema>_response.json.">
+          Save:
+          <select id="saveMode">
+            <option value="request">request payload</option>
+            <option value="response">response body</option>
+            <option value="both">both</option>
+          </select>
+        </label>
+
+        <label class="inline" title="What to do with requests that match the rules in Settings → Matching rules">
           Matching rules:
           <select id="ruleAction">
             <option value="off">do nothing</option>
@@ -44,7 +53,7 @@
         <input type="text" id="viewSearch" placeholder="Filter URL or schema (text or re:…)" spellcheck="false" />
         <select id="viewMethod"></select>
         <label class="inline" title="Hide scripts, styles, images, fonts, media, preflights and page loads"><input type="checkbox" id="viewHideStatic" /> Hide static files</label>
-        <label class="inline"><input type="checkbox" id="viewJsonOnly" /> JSON body only</label>
+        <label class="inline" title="Only rows with a JSON body to save, for the current Save setting"><input type="checkbox" id="viewJsonOnly" /> Savable only</label>
         <span id="counters" class="counters"></span>
 
         <span class="spacer"></span>
@@ -53,14 +62,29 @@
         <button id="unflagAll">Unflag all</button>
         <button id="syncNetwork" title="Add every request the Network tab has that this list is missing">Sync from Network tab</button>
         <button id="clearList">Clear list</button>
+        <button id="copyDiagnostics" title="A report of what Chrome gave the extension for recent requests. No body contents, cookies or auth headers.">Copy diagnostics</button>
       </div>
     </header>
+
+    <dialog id="reportDialog">
+      <h3>Diagnostics</h3>
+      <p class="help">
+        This report has no request or response bodies, no cookies and no auth headers. URL query values are replaced
+        with <code>…</code>. Check it before you share it.
+      </p>
+      <textarea id="reportText" rows="20" readonly spellcheck="false"></textarea>
+      <div class="button-row">
+        <button id="copyReport" class="primary">Copy</button>
+        <button id="closeReport">Close</button>
+        <span id="reportStatus" class="muted"></span>
+      </div>
+    </dialog>
 
     <main>
       <table class="captures">
         <thead>
           <tr>
-            <th class="col-flag"><input type="checkbox" id="flagAll" title="Flag / unflag every visible request that has a JSON body" /></th>
+            <th class="col-flag"><input type="checkbox" id="flagAll" title="Flag / unflag every visible request that has something to save" /></th>
             <th class="col-time">Time</th>
             <th class="col-method">Method</th>
             <th class="col-code">Code</th>
@@ -87,7 +111,7 @@
         <label>Matching rules</label>
         <div>
           <small class="lead">
-            A request with a JSON body matches when it has one of these methods, its response is 2xx (if checked),
+            A request with something to save (see the Save menu) matches when it has one of these methods, its response is 2xx (if checked),
             <b>and</b> its URL matches the filter.
             The "Matching rules" menu in the toolbar sets what happens to matches.
           </small>
@@ -155,11 +179,11 @@
           <input type="text" class="schema-input" spellcheck="false" />
           <span class="schema-source"></span>
         </td>
-        <td class="col-status"><span class="status"></span><div class="status-detail"></div></td>
+        <td class="col-status"></td>
         <td class="col-actions">
           <button class="send-btn" title="Save this request now">Save</button>
           <button class="map-btn" title="Add a mapping row for this URL + method using the current schema name">+ Map</button>
-          <button class="view-btn" title="Show request body">{ }</button>
+          <button class="view-btn" title="Show request payload, response body and diagnostics">{ }</button>
         </td>
       </tr>
     </template>

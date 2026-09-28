@@ -49,9 +49,10 @@ When you edit the extension code, click the reload icon on the extension card. T
 3. Click the **Payload Capture** tab. If you do not see it, look in the `»` overflow menu. The toolbar must show **server: ok**.
 4. Optional: in **Save to**, type the folder for the files (refer to [Choosing the output folder](#choosing-the-output-folder)). The line below it shows the full path that the server will write to.
 5. Use your app. **Every** request appears in the list, newest at the top.
-6. Put a check mark in the box on each request you want to keep. Only requests with a JSON body have a box. By default, successful POST, PUT and PATCH requests get a check mark automatically (refer to [Matching rules](#matching-rules)).
-7. Correct the **Schema name** if necessary. This is the file name.
-8. Click **Save flagged (N)**. Each row changes to **SAVED** and shows the path it was written to. To save one row immediately, click **Save** on that row (or press Enter in its name field).
+6. In the **Save** menu, select what to save: the **request payload** (what the frontend sent, the default), the **response body** (what the backend returned), or **both**.
+7. Put a check mark in the box on each request you want to keep. Only rows with something to save for the **Save** setting have a box. By default, successful POST, PUT and PATCH requests get a check mark automatically (refer to [Matching rules](#matching-rules)).
+8. Correct the **Schema name** if necessary. This is the file name.
+9. Click **Save flagged (N)**. Each row changes to **SAVED** and shows the path it was written to. To save one row immediately, click **Save** on that row (or press Enter in its name field).
 
 The extension starts to record when DevTools opens, not when you click the panel. When the panel opens, it also reads everything that the Network tab has already recorded. It does not see requests from before DevTools opened, so open DevTools first and then reload the page.
 
@@ -64,7 +65,8 @@ The list keeps up to 5000 requests. Static files (scripts, styles, images and si
 | Control | What it does |
 | ------- | ------------ |
 | **Record** switch | Pauses and resumes the list. While it is off, new requests are not recorded. |
-| **Matching rules** | What happens to JSON requests that match the rules: *do nothing*, *flag them* (default), or *save them immediately*. |
+| **Save** | What is written to disk: *request payload* (default), *response body*, or *both*. Refer to [Request payload and response body](#request-payload-and-response-body). |
+| **Matching rules** | What happens to requests that match the rules: *do nothing*, *flag them* (default), or *save them immediately*. |
 | **Save to** | Output folder for the next saves. The dropdown shows recent folders. ✕ goes back to the server default. |
 | **Test server** | Calls `GET /health` and refreshes the "Save to" path. |
 
@@ -75,32 +77,51 @@ The list keeps up to 5000 requests. Static files (scripts, styles, images and si
 | Search box | Filters by URL or schema name. Plain text is a substring match; `re:` is a regex. |
 | Method menu | Shows only one method. |
 | **Hide static files** (on by default) | Hides scripts, styles, images, fonts, media, preflights and page loads. It shows all other types, for example `fetch`, `xhr`, `ping` (`sendBeacon`), `eventsource` and `other`. A form POST is not hidden. Hover over the **Code** cell to see Chrome's type. |
-| **JSON body only** | Hides requests that you cannot save. |
+| **Savable only** | Hides rows that have nothing to save for the current **Save** setting. |
 | **Save flagged (N)** | Saves all flagged rows, including rows that the filters hide. It saves them oldest first, so history files stay in request order. |
 | **Unflag all**, header check box | Clears all flags. The header box flags or unflags every visible row that can be saved. |
+| **Copy diagnostics** | Opens a report about what Chrome gave the extension for the newest 40 requests. Refer to [Help to find a problem](#help-to-find-a-problem). |
 | **Sync from Network tab** | Adds each request from the Network tab's log that the list does not have yet, and skips duplicates. It adds requests even when **Record** is off. If the matching rules are set to *save them immediately*, a sync only flags the requests. |
 
 **Rows**
 
 | Column | Meaning |
 | ------ | ------- |
-| Check box | Flags the row for **Save flagged**. It shows only for requests with a JSON body. |
+| Check box | Flags the row for **Save flagged**. It shows only for rows with something to save for the **Save** setting. |
 | Code | The HTTP response status. Codes 4xx and 5xx are red. Hover to see Chrome's resource type. |
 | Schema name | Editable. The label shows where the name came from: `mapped`, `derived` (from the URL) or `edited`. It also shows `saves as …` if the server will sanitize the name. |
-| Saved? | `NOT SAVED`, `SAVED` (with the path), or `FAILED` (with the server or network error). For requests without a JSON body, it shows why. |
+| Saved? | `NOT SAVED`, `SAVED` (with the path), or `FAILED` (with the server or network error). With **Save: both**, there is one line for the request and one for the response. If there is nothing to save, it shows why, for example "Body is not JSON (text/xml)". |
 | **Save / Save again** | Saves this row now, with the current name and folder. |
 | **+ Map** | Adds a mapping row (URL path + method → current name) at the top of the mapping table. |
-| **{ }** | Shows the request body. Non-JSON bodies show as raw text. |
+| **{ }** | Shows the request payload, the response body and the diagnostics for this request. Non-JSON bodies show as raw text. |
 
 ### Matching rules
 
-Open **Settings** to change the rules. A request with a JSON body matches when:
+Open **Settings** to change the rules. A request with something to save (for the **Save** setting) matches when:
 
 - its method is one of the selected methods (default POST, PUT, PATCH), **and**
 - its response is 2xx, if **Only successful (2xx) responses** is on (default on), **and**
 - its URL matches the **URL filter** (empty means all URLs; plain text is a substring match; `re:` is a regex).
 
 The **Matching rules** menu in the toolbar sets what happens to a match. Set it to *do nothing* to flag everything by hand. Set it to *save them immediately* for fully automatic capture, which is how the first version worked.
+
+### Request payload and response body
+
+- The **request payload** is the body that the frontend sent (Chrome's "Payload" tab). It is saved as `<schema>.json`.
+- The **response body** is what the backend returned (Chrome's "Response" tab). It is saved as `<schema>_response.json`, next to the request payload. History mode works the same for both. To change the suffix, edit `RESPONSE_SUFFIX` in `panel.js`.
+
+What can be saved:
+
+| Body | Result |
+| ---- | ------ |
+| JSON, with any `Content-Type` (also `text/plain`, `sendBeacon`, `keepalive`, `Blob`, typed arrays, XHR) | Saved as is. |
+| Form data (`application/x-www-form-urlencoded` or `multipart/form-data`) | Saved as a JSON object of the fields, for example `{ "name": "Ada", "age": "36" }`. A repeated field becomes an array. A file field becomes `{ "fileName": "…", "contentType": "…" }`, without the file content. |
+| A response with the `)]}'` prefix or a byte-order mark | The prefix is removed, then the JSON is saved. |
+| A body sent as a stream (`fetch` with a `ReadableStream` body) | Cannot be saved. Chrome does not record streamed bodies. |
+| XML, GraphQL over `multipart` with files, protobuf, other binary data | Cannot be saved. The row shows the type. |
+| A response that DevTools no longer has in memory | Cannot be saved. Reload the page with DevTools open and do the action again. |
+
+The panel does not load response bodies of static files (scripts, images and similar).
 
 ### Choosing the output folder
 
@@ -196,8 +217,33 @@ This matters because a save request chooses its own output folder. If the server
 | What counts as a static file             | `devtools-extension/request-types.js`: `isStaticRequest()` |
 | Mapping match rules                      | `devtools-extension/panel.js`: `compilePattern()`, `resolveSchemaName()` |
 | Fallback name from the URL               | `devtools-extension/panel.js`: `deriveSchemaName()`, `isIdLike()` |
+| How request and response bodies are read | `devtools-extension/panel.js`: `parseRequestBody()`, `loadResponseBody()` |
+| File name suffix for response bodies     | `devtools-extension/panel.js`: `RESPONSE_SUFFIX` |
 | Default mapping rows                     | `devtools-extension/default-mappings.js` |
 | File names, history and flat behavior    | `capture-server/src/storage.js` |
+
+## Help to find a problem
+
+If a request is missing, or its payload or response cannot be saved, send a diagnostics report to the maintainer:
+
+1. Reproduce the problem with DevTools open: do the action in your app again.
+2. In the Payload Capture panel, click **Copy diagnostics**. For one request only, click **{ }** on its row and then **Copy** next to "Diagnostics".
+3. Read the text. It contains **no** request or response bodies, cookies or auth headers. URL query values are replaced with `…`. Paths and host names stay in the report. Remove any that you do not want to share.
+4. Paste the text into your message. Add:
+   - the method and path of the request that has the problem,
+   - what Chrome's own Network tab shows for it: open the request, then the **Payload** tab (is there a payload? "Request Payload" or "Form Data"?), and the **Headers** tab (`Content-Type` of the request),
+   - which library the frontend uses for the call, if you know it (fetch, axios, Apollo, a generated client, and so on).
+
+Useful fields in the report:
+
+| Field | Meaning |
+| ----- | ------- |
+| `request.postData` | What Chrome gave the extension. `"(missing)"` means Chrome recorded no body. |
+| `request.postData.firstChar` | The first character of the body: `{` or `[` is JSON, a letter is often form data. |
+| `request.result` | `json`, `form`, or why the payload cannot be saved. |
+| `response.hasGetContent`, `responseResult` | Whether Chrome could give the response body, and the result. |
+| `chromeType`, `viaServiceWorker` | Chrome's resource type, and whether a service worker handled the request. |
+| `visible`, `flagged`, `saves` | What the panel did with the row. |
 
 ## Missing API calls
 
@@ -205,8 +251,8 @@ If a call from your frontend to your backend is not in the list, do these checks
 
 1. **Is the call in Chrome's own Network tab?**
    - **No, it is not.** The extension cannot see it either. Usually DevTools was opened after the call. Keep DevTools open and reload the page, or repeat the action. Also make sure that DevTools is open on the correct tab. A popup window or a new tab (for example, a login flow) has its own DevTools.
-   - **Yes, it is.** Click **Sync from Network tab**. If the call then appears, something removed it from the list before. Tell the maintainer, because this should not happen.
-2. **Does the counter show "showing X of Y" with X less than Y?** The view filters hide some rows. Clear the search box, set the method menu to *All methods*, and turn off **JSON body only** and **Hide static files**.
+   - **Yes, it is.** Click **Sync from Network tab**. If the call then appears, something removed it from the list before. Send a report (refer to [Help to find a problem](#help-to-find-a-problem)), because this should not happen.
+2. **Does the counter show "showing X of Y" with X less than Y?** The view filters hide some rows. Clear the search box, set the method menu to *All methods*, and turn off **Savable only** and **Hide static files**.
 3. **Is Record on?** While it is off, new requests are not recorded. **Sync from Network tab** still adds them.
 4. **Does the frontend call the backend through WebSockets** (Socket.IO, GraphQL subscriptions and similar)? WebSocket messages are not HTTP requests, so they are not captured. Only the first connection request shows.
 5. **Does the backend make the call, not the browser?** The browser cannot see server-to-server calls. Refer to [Using it with an app that runs on your computer](#using-it-with-an-app-that-runs-on-your-computer).
@@ -219,4 +265,4 @@ If a call from your frontend to your backend is not in the list, do these checks
 - **Every row FAILED "Cannot reach …"**: the server is not running, or the port in *Capture server URL* is not the server's port.
 - **FAILED "Origin not allowed"**: a request came from outside the extension. Refer to the [Security note](#security-note).
 - **Requests do not appear**: refer to [Missing API calls](#missing-api-calls).
-- **No check box on a row**: the request has no JSON body. It is form data, multipart, plain text, or has no body. Only JSON bodies can be saved.
+- **No check box on a row**: there is nothing to save for the current **Save** setting. The **Saved?** column shows why. Refer to [Request payload and response body](#request-payload-and-response-body).

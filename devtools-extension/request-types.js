@@ -28,8 +28,15 @@ function isStaticRequest(har) {
   return false;
 }
 
-/** Identifies a request across onRequestFinished and getHAR(), to skip duplicates. */
+/**
+ * Identifies a request across onRequestFinished and getHAR(), to skip duplicates.
+ *
+ * startedDateTime has only millisecond precision, and requests sent together
+ * (Promise.all of several POSTs to one URL) share it. `time` is the request's
+ * total duration with sub-millisecond precision: it differs between such
+ * requests, and both APIs report the same value for the same request.
+ */
 // eslint-disable-next-line no-unused-vars
 function requestKey(har) {
-  return `${har.startedDateTime}|${har.request.method}|${har.request.url}`;
+  return `${har.startedDateTime}|${har.time}|${har.request.method}|${har.request.url}`;
 }
