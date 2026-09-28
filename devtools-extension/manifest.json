@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Payload Capture",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "DevTools panel that captures JSON request bodies and sends them to a local capture server.",
   "minimum_chrome_version": "102",
   "devtools_page": "devtools.html",

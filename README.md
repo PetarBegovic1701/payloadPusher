@@ -238,6 +238,10 @@ Useful fields in the report:
 
 | Field | Meaning |
 | ----- | ------- |
+| `extensionVersion` | The version that runs. If it is not the newest, reload the extension in `chrome://extensions` and reopen DevTools. |
+| `chromeNetworkLog.newest` | The newest requests in Chrome's own log for this tab (`getHAR()`), with `inPanel` for each. A request with `inPanel: false` was lost by the panel. A request that is not in this list at all is not given to extensions by Chrome. |
+| `receivedEvents` | Every request that Chrome delivered to the panel, and what the panel did with it: `added`, `duplicate`, `record off`, or `error: …`. |
+| `panelErrors` | Errors in the panel. A request that causes an error still gets a row, which shows the error. |
 | `request.postData` | What Chrome gave the extension. `"(missing)"` means Chrome recorded no body. |
 | `request.postData.firstChar` | The first character of the body: `{` or `[` is JSON, a letter is often form data. |
 | `request.result` | `json`, `form`, or why the payload cannot be saved. |
