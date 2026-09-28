@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Payload Capture",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "DevTools panel that captures JSON request bodies and sends them to a local capture server.",
-  "minimum_chrome_version": "102",
+  "minimum_chrome_version": "111",
   "devtools_page": "devtools.html",
   "action": {
     "default_title": "Payload Capture: open DevTools to use it",
@@ -15,5 +15,20 @@
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*", "https://127.0.0.1/*"],
+      "js": ["page-hook.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*", "https://127.0.0.1/*"],
+      "js": ["page-bridge.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
   ]
 }

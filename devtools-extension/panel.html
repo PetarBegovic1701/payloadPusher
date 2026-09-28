@@ -102,6 +102,17 @@
     <details id="settingsSection" class="section">
       <summary>Settings</summary>
       <div class="form-grid">
+        <label for="pageCapture">Page capture</label>
+        <div>
+          <label class="inline"><input type="checkbox" id="pageCapture" /> Also record fetch/XHR (Axios) from inside the page</label>
+          <small>
+            Reads each request body when your app sends it, so requests that DevTools does not give to extensions are
+            still listed. Works for apps on <code>localhost</code> and <code>127.0.0.1</code> (http and https); reload the
+            app's page after installing or updating the extension. Rows recorded this way have a
+            <span class="page-badge">page</span> mark.
+          </small>
+        </div>
+
         <label for="serverUrl">Capture server URL</label>
         <div>
           <input type="text" id="serverUrl" placeholder="http://127.0.0.1:4545" spellcheck="false" />

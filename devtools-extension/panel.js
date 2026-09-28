@@ -42,6 +42,7 @@ const DEFAULT_SETTINGS = {
   outputDir: '', // '' = server's default (--output-dir)
   recentOutputDirs: [],
   saveMode: 'request', // 'request' | 'response' | 'both'
+  pageCapture: true, // also record fetch/XHR from inside the page (page-hook.js)
   // Matching rules: what to do with a request that matches them.
   ruleAction: 'flag', // 'off' | 'flag' | 'save'
   ruleMethods: ['POST', 'PUT', 'PATCH'],
@@ -272,6 +273,7 @@ function parseRequestBody(har) {
   const postData = har.request.postData;
 
   if (!postData) {
+    if (har._requestNote) return noBody(har._requestNote); // page capture could not copy the body
     if (!BODY_METHODS.includes(method)) return noBody('');
     if (har.request.bodySize > 0) {
       return noBody(`Chrome did not record the body (${har.request.bodySize} bytes were sent)`);
@@ -332,6 +334,7 @@ async function loadResponseBody(har) {
   let content = info.text;
   let encoding = info.encoding || '';
   if (content === undefined) {
+    if (har._fromPage) return noBody(`Response body not copied by page capture (${mime}; only text/JSON up to 5 MB)`);
     if (typeof har.getContent !== 'function') return noBody('Response body not available from Chrome');
     const result = await getContent(har);
     if (result.timedOut) return noBody('Chrome did not return the response body in time');
@@ -389,8 +392,72 @@ async function ingest(har, options = {}) {
     recordError('ingest', err);
     showIngestError(har, err, ctx);
   }
-  logEvent(har, options.backfill ? 'sync' : 'live', outcome);
+  logEvent(har, options.source === 'page' ? 'page' : options.backfill ? 'sync' : 'live', outcome);
   return outcome === 'added';
+}
+
+/**
+ * Page capture (page-hook.js -> page-bridge.js -> here). Each message is one
+ * fetch/XHR the app made; it is turned into a HAR-like entry so the rest of
+ * the pipeline treats it like a request from DevTools.
+ */
+function pageEventToHar(m) {
+  const body = m.requestBody;
+  const text = body && typeof body.text === 'string' ? body.text : undefined;
+  const hasBody = body && (text !== undefined || Array.isArray(body.params));
+  return {
+    startedDateTime: m.started,
+    time: m.duration,
+    _resourceType: m.kind,
+    _fromPage: true,
+    _requestNote: body && body.note,
+    request: {
+      method: m.method,
+      url: m.url,
+      headers: m.requestContentType ? [{ name: 'Content-Type', value: m.requestContentType }] : [],
+      bodySize: text ? text.length : 0,
+      postData: hasBody ? { mimeType: body.mimeType || m.requestContentType || '', text, params: body.params } : undefined,
+    },
+    response: {
+      status: m.status,
+      _error: m.error,
+      content: {
+        mimeType: m.responseContentType || '',
+        size: typeof m.responseBody === 'string' ? m.responseBody.length : 0,
+        text: typeof m.responseBody === 'string' ? m.responseBody : undefined,
+      },
+    },
+  };
+}
+
+function initPageCapture() {
+  if (!chrome.runtime || !chrome.runtime.onMessage) return;
+  chrome.runtime.onMessage.addListener((message, sender) => {
+    if (!message || message.type !== 'payload-capture/page-request') return;
+    if (!sender.tab || sender.tab.id !== chrome.devtools.inspectedWindow.tabId) return;
+    if (!state.settings.pageCapture) return;
+    ingest(pageEventToHar(message.data), { source: 'page' });
+  });
+}
+
+/** A short signature of a request body, to recognise one request seen by both sources. */
+function bodySignature(parsed) {
+  if (parsed.has) return JSON.stringify(parsed.json);
+  return parsed.raw || '';
+}
+
+/**
+ * The same request can arrive twice: from DevTools and from page capture.
+ * Whichever arrives first is kept.
+ */
+function findOtherSourceCopy(source, method, url, time, signature) {
+  for (const e of state.entries) {
+    if (e.time < time - 5000) break; // entries are newest first
+    if (e.source !== source && e.method === method && e.url === url && Math.abs(e.time - time) < 5000 && e.bodySignature === signature) {
+      return e;
+    }
+  }
+  return null;
 }
 
 function logEvent(har, source, outcome) {
@@ -449,23 +516,31 @@ async function ingestRequest(har, options, ctx) {
 
   const url = har.request.url;
   if (/^(data|blob|chrome-extension):/.test(url)) return 'skipped: data/blob/extension URL';
+  const source = options.source === 'page' ? 'page' : 'devtools';
   const key = requestKey(har);
   if (state.seen.has(key)) return 'duplicate';
-  state.seen.add(key);
   const method = (har.request.method || '').toUpperCase();
   const timestamp = har.startedDateTime || new Date().toISOString();
+  const time = Date.parse(timestamp) || Date.now();
   const isStatic = isStaticRequest(har);
+  const request = parseRequestBody(har);
+  const signature = bodySignature(request);
+  const copy = findOtherSourceCopy(source, method, url, time, signature);
+  state.seen.add(key);
+  if (copy) return `duplicate (already listed from ${copy.source === 'page' ? 'page capture' : 'DevTools'})`;
 
   const entry = {
     id: nextId++,
     timestamp,
-    time: Date.parse(timestamp) || Date.now(),
+    time,
     isStatic,
+    source,
+    bodySignature: signature,
     method,
     url,
     resourceType: har._resourceType || '',
     responseStatus: har.response ? har.response.status : 0,
-    request: parseRequestBody(har),
+    request,
     response: isStatic ? noBody('') : { ...noBody('Loading response…'), loading: true },
     schemaName: '',
     schemaSource: '',
@@ -663,7 +738,10 @@ function createRow(entry) {
   const code = row.querySelector('.col-code');
   code.textContent = entry.responseStatus || '';
   code.classList.toggle('code-error', entry.responseStatus >= 400 || entry.responseStatus === 0);
-  code.title = entry.resourceType ? `Chrome type: ${entry.resourceType}` : '';
+  code.title =
+    (entry.resourceType ? `Chrome type: ${entry.resourceType}` : '') +
+    (entry.source === 'page' ? ' · recorded by page capture' : ' · recorded by DevTools');
+  row.classList.toggle('from-page', entry.source === 'page');
   const urlText = row.querySelector('.url-text');
   urlText.textContent = entry.url;
   urlText.title = entry.url;
@@ -999,6 +1077,7 @@ function buildDiagnostics(har, isStatic) {
     method: req.method,
     url: redactUrl(req.url || ''),
     chromeType: har._resourceType || '(none)',
+    source: har._fromPage ? 'page capture' : 'DevTools',
     isStatic,
     initiator: har._initiator ? har._initiator.type : undefined,
     viaServiceWorker: res._fetchedViaServiceWorker,
@@ -1232,6 +1311,13 @@ function initToolbar() {
 }
 
 function initSettings() {
+  const pageCapture = $('pageCapture');
+  pageCapture.checked = state.settings.pageCapture;
+  pageCapture.addEventListener('change', () => {
+    state.settings.pageCapture = pageCapture.checked;
+    saveSettings();
+  });
+
   const serverUrl = $('serverUrl');
   serverUrl.value = state.settings.serverUrl;
   serverUrl.addEventListener('change', () => {
@@ -1464,6 +1550,7 @@ function applyTheme() {
   initSettings();
   initMappings();
   renderCounters();
+  initPageCapture();
   resolveReady();
   // Pick up what the Network tab recorded before this panel was first opened.
   backfill();
