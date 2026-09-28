@@ -13,14 +13,15 @@
 //   5. Output folder
 //   6. Settings + mappings UI
 
-/* global DEFAULT_MAPPINGS */
+/* global DEFAULT_MAPPINGS, isStaticRequest, requestKey */
 
 // ---------------------------------------------------------------------------
 // 1. Settings & storage
 // ---------------------------------------------------------------------------
 
 const ALL_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
-const MAX_ROWS = 1000;
+const MAX_ROWS = 5000; // all rows
+const MAX_STATIC_ROWS = 300; // of which scripts, images, … (oldest are dropped first)
 const MAX_RECENT_DIRS = 8;
 const MAX_RAW_BODY = 100 * 1024; // keep at most 100 KB of non-JSON bodies for viewing
 
@@ -35,13 +36,17 @@ const DEFAULT_SETTINGS = {
   ruleUrlFilter: '',
   ruleOkOnly: true, // only match requests whose response was 2xx
   // What the list shows. Does not affect what is recorded.
-  view: { search: '', method: '', apiOnly: true, jsonOnly: false },
+  view: { search: '', method: '', hideStatic: true, jsonOnly: false },
 };
 
 const state = {
   settings: structuredClone(DEFAULT_SETTINGS),
   mappings: [],
   entries: [], // newest first
+  seen: new Set(), // requestKey() of everything listed, to skip duplicates
+  staticCount: 0,
+  dropped: 0, // non-static rows removed because of MAX_ROWS
+  batching: false,
 };
 
 async function loadState() {
@@ -53,6 +58,7 @@ async function loadState() {
   delete saved.methods;
   delete saved.urlFilter;
   delete saved.autoSend;
+  if (saved.view) delete saved.view.apiOnly; // replaced by hideStatic
   state.settings = {
     ...structuredClone(DEFAULT_SETTINGS),
     ...saved,
@@ -184,8 +190,7 @@ function resolveSchemaName(url, method) {
 /** List view filter. Only changes what is shown, never what is recorded. */
 function isVisible(entry) {
   const v = state.settings.view;
-  // resourceType is Chrome's "Type" column (fetch, xhr, script, image, …).
-  if (v.apiOnly && entry.resourceType && !['fetch', 'xhr'].includes(entry.resourceType)) return false;
+  if (v.hideStatic && entry.isStatic) return false;
   if (v.jsonOnly && !entry.hasJson) return false;
   if (v.method && entry.method !== v.method) return false;
   const search = v.search.trim();
@@ -202,20 +207,31 @@ let resolveReady;
 const ready = new Promise((r) => (resolveReady = r));
 
 /**
- * Entry point called by devtools.js for every finished network request
- * (a HAR entry from chrome.devtools.network.onRequestFinished).
+ * Entry point for every finished network request (a HAR entry). Called by
+ * devtools.js for live requests, and by backfill() for the Network tab's log.
+ *
+ * options.backfill: the request is from the Network tab's log, not live. It
+ *   ignores the Record switch, and "save them immediately" only flags it, so
+ *   a sync never saves a pile of old requests by surprise.
+ * Returns true if a row was added.
  */
-async function ingest(har) {
+async function ingest(har, options = {}) {
   await ready;
-  if (!state.settings.captureEnabled) return;
+  if (!state.settings.captureEnabled && !options.backfill) return false;
 
   const url = har.request.url;
-  if (/^(data|blob|chrome-extension):/.test(url)) return;
+  if (/^(data|blob|chrome-extension):/.test(url)) return false;
+  const key = requestKey(har);
+  if (state.seen.has(key)) return false;
+  state.seen.add(key);
   const method = (har.request.method || '').toUpperCase();
+  const timestamp = har.startedDateTime || new Date().toISOString();
 
   const entry = {
     id: nextId++,
-    timestamp: har.startedDateTime || new Date().toISOString(),
+    timestamp,
+    time: Date.parse(timestamp) || Date.now(),
+    isStatic: isStaticRequest(har),
     method,
     url,
     resourceType: har._resourceType || '',
@@ -249,12 +265,31 @@ async function ingest(har) {
   entry.schemaName = resolved.name;
   entry.schemaSource = resolved.source;
 
-  const ruleHit = entry.hasJson && state.settings.ruleAction !== 'off' && matchesRules(method, url, entry.responseStatus);
-  if (ruleHit && state.settings.ruleAction === 'flag') entry.flagged = true;
+  const action = state.settings.ruleAction === 'save' && options.backfill ? 'flag' : state.settings.ruleAction;
+  const ruleHit = entry.hasJson && action !== 'off' && matchesRules(method, url, entry.responseStatus);
+  if (ruleHit && action === 'flag') entry.flagged = true;
 
   addEntry(entry);
 
-  if (ruleHit && state.settings.ruleAction === 'save') save(entry);
+  if (ruleHit && action === 'save') save(entry);
+  return true;
+}
+
+/** Add every request the Network tab has that the list doesn't. */
+async function backfill() {
+  const log = await new Promise((resolve) => chrome.devtools.network.getHAR(resolve));
+  const entries = (log && log.entries) || [];
+  let added = 0;
+  state.batching = true; // skip per-row counter updates; one render at the end
+  try {
+    for (const har of entries) {
+      if (await ingest(har, { backfill: true })) added++;
+    }
+  } finally {
+    state.batching = false;
+    renderCounters();
+  }
+  return added;
 }
 
 async function save(entry) {
@@ -323,16 +358,35 @@ const STATUS_LABELS = {
 };
 
 function addEntry(entry) {
-  state.entries.unshift(entry);
+  // Keep newest first. Live requests go straight to the top; backfilled
+  // ones may belong further down.
+  let index = 0;
+  while (index < state.entries.length && state.entries[index].time > entry.time) index++;
+  const before = state.entries[index];
+  state.entries.splice(index, 0, entry);
+
   const els = createRow(entry);
   rowEls.set(entry.id, els);
-  $('captureRows').prepend(els.row);
+  const tbody = $('captureRows');
+  tbody.insertBefore(els.row, before ? rowEls.get(before.id).row : null);
 
-  while (state.entries.length > MAX_ROWS) {
-    const old = state.entries.pop();
-    removeRow(old.id);
+  if (entry.isStatic) state.staticCount++;
+  // Static files have their own small budget so they can't push API calls out.
+  if (state.staticCount > MAX_STATIC_ROWS) {
+    evict(state.entries.findLastIndex((e) => e.isStatic));
   }
-  renderCounters();
+  while (state.entries.length > MAX_ROWS) {
+    const last = state.entries[state.entries.length - 1];
+    if (!last.isStatic) state.dropped++;
+    evict(state.entries.length - 1);
+  }
+  if (!state.batching) renderCounters();
+}
+
+function evict(index) {
+  const [old] = state.entries.splice(index, 1);
+  if (old.isStatic) state.staticCount--;
+  removeRow(old.id);
 }
 
 function removeRow(id) {
@@ -363,7 +417,7 @@ function createRow(entry) {
   const code = row.querySelector('.col-code');
   code.textContent = entry.responseStatus || '';
   code.classList.toggle('code-error', entry.responseStatus >= 400 || entry.responseStatus === 0);
-  code.title = entry.resourceType ? `type: ${entry.resourceType}` : '';
+  code.title = entry.resourceType ? `Chrome type: ${entry.resourceType}` : '';
   const urlText = row.querySelector('.url-text');
   urlText.textContent = entry.url;
   urlText.title = entry.url;
@@ -478,7 +532,9 @@ function renderCounters() {
     }
   }
   $('counters').textContent =
-    `showing ${shown} of ${state.entries.length} · ${saved} saved` + (failed ? ` · ${failed} failed` : '');
+    `showing ${shown} of ${state.entries.length} · ${saved} saved` +
+    (failed ? ` · ${failed} failed` : '') +
+    (state.dropped ? ` · ${state.dropped} oldest dropped (limit ${MAX_ROWS})` : '');
   $('saveFlagged').textContent = `Save flagged (${flagged})`;
   $('saveFlagged').disabled = flagged === 0;
   $('unflagAll').disabled = flagged === 0;
@@ -491,7 +547,8 @@ function renderCounters() {
   $('emptyHint').classList.toggle('hidden', shown > 0);
   $('emptyHint').textContent =
     state.entries.length === 0
-      ? 'No requests yet. Use the inspected page and its requests appear here.'
+      ? 'No requests yet. Use the inspected page and its requests appear here. ' +
+        'Requests made before DevTools was opened are not visible: reload the page with DevTools open.'
       : `${state.entries.length} request(s) hidden by the view filters above.`;
 }
 
@@ -517,7 +574,18 @@ function initList() {
   $('clearList').addEventListener('click', () => {
     for (const e of state.entries) removeRow(e.id);
     state.entries = [];
+    state.seen.clear();
+    state.staticCount = 0;
+    state.dropped = 0;
     renderCounters();
+  });
+  $('syncNetwork').addEventListener('click', async () => {
+    const button = $('syncNetwork');
+    button.disabled = true;
+    const added = await backfill();
+    button.disabled = false;
+    button.textContent = `Sync from Network tab (+${added})`;
+    setTimeout(() => (button.textContent = 'Sync from Network tab'), 2500);
   });
 
   // View filters.
@@ -545,7 +613,7 @@ function initList() {
     applyView();
   });
 
-  for (const [id, key] of [['viewApiOnly', 'apiOnly'], ['viewJsonOnly', 'jsonOnly']]) {
+  for (const [id, key] of [['viewHideStatic', 'hideStatic'], ['viewJsonOnly', 'jsonOnly']]) {
     const cb = $(id);
     cb.checked = v[key];
     cb.addEventListener('change', () => {
@@ -895,5 +963,7 @@ function applyTheme() {
   initMappings();
   renderCounters();
   resolveReady();
+  // Pick up what the Network tab recorded before this panel was first opened.
+  backfill();
   testServer();
 })();

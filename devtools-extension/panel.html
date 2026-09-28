@@ -43,7 +43,7 @@
       <div class="toolbar filters">
         <input type="text" id="viewSearch" placeholder="Filter URL or schema (text or re:…)" spellcheck="false" />
         <select id="viewMethod"></select>
-        <label class="inline"><input type="checkbox" id="viewApiOnly" /> Fetch/XHR only</label>
+        <label class="inline" title="Hide scripts, styles, images, fonts, media, preflights and page loads"><input type="checkbox" id="viewHideStatic" /> Hide static files</label>
         <label class="inline"><input type="checkbox" id="viewJsonOnly" /> JSON body only</label>
         <span id="counters" class="counters"></span>
 
@@ -51,6 +51,7 @@
 
         <button id="saveFlagged" class="primary">Save flagged (0)</button>
         <button id="unflagAll">Unflag all</button>
+        <button id="syncNetwork" title="Add every request the Network tab has that this list is missing">Sync from Network tab</button>
         <button id="clearList">Clear list</button>
       </div>
     </header>
@@ -163,6 +164,7 @@
       </tr>
     </template>
 
+    <script src="request-types.js"></script>
     <script src="default-mappings.js"></script>
     <script src="panel.js"></script>
   </body>
