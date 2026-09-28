@@ -38,6 +38,7 @@ Options: `--port`, `--output-dir`, `--flat` (or `PORT`, `OUTPUT_DIR`, `FLAT` in 
 2. Turn on **Developer mode** (top-right toggle).
 3. Click **Load unpacked** and select the `devtools-extension/` folder.
 4. If DevTools is already open on a tab, close it and open it again. Chrome adds panels only when DevTools opens.
+5. The tool is **not** in the Extensions (puzzle-piece) menu. Open DevTools on your app's tab (F12) and click the **Payload Capture** tab. The toolbar button only shows these instructions.
 
 When you edit the extension code, click the reload icon on the extension card. Then close and reopen DevTools.
 
@@ -197,6 +198,7 @@ This matters because a save request chooses its own output folder. If the server
 ## Troubleshooting
 
 - **No "Payload Capture" tab**: close and reopen DevTools after you load or reload the extension.
+- **The extension's toolbar button does nothing useful**: this is correct. The extension works inside DevTools. The toolbar button only opens a short help popup, which also shows whether the capture server runs.
 - **Every row FAILED "Cannot reach …"**: the server is not running, or the port in *Capture server URL* is not the server's port.
 - **FAILED "Origin not allowed"**: a request came from outside the extension. Refer to the [Security note](#security-note).
 - **Requests do not appear**: check that **Record** is on. The counter shows "showing X of Y". If X is less than Y, the view filters hide some rows. Turn off **Fetch/XHR only** to see all resource types.
